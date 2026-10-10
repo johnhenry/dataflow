@@ -1,6 +1,6 @@
 {
   "name": "@johnhenry/dataflow",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "An async dataflow scheduler: nodes that depend on other nodes, run by your async function, with glitch-free propagation, stale-run cancellation, skip values and per-node run states. Values live wherever you keep them.",
   "type": "module",
   "main": "src/index.mjs",
@@ -25,7 +25,8 @@
     "example:01": "node examples/01-a-spreadsheet-recomputes-only-what-changed.mjs",
     "example:02": "node examples/02-a-slow-stale-run-never-overwrites-a-newer-one.mjs",
     "example:03": "node examples/03-errors-make-dependents-wait-not-fail.mjs",
-    "example:04": "node examples/04-skip-values.mjs"
+    "example:04": "node examples/04-skip-values.mjs",
+    "example:05": "node examples/05-partial-runs-and-unchanged.mjs"
   },
   "keywords": [
     "dataflow",

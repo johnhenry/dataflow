@@ -19,6 +19,8 @@ Zero dependencies. ESM. Runs in browsers, Workers and Node.
 - [States](#states)
 - [Guarantees](#guarantees)
 - [Skipping](#skipping)
+- [Partial runs](#partial-runs)
+- [Equality cut-off](#equality-cut-off)
 - [API](#api)
 - [Honest limitations](#honest-limitations)
 - [Family](#family)
@@ -81,7 +83,7 @@ Runnable, self-verifying versions are in [`examples/`](examples/).
 | `skipped` | The last run returned `SKIP` / `skip(reason)`, or an input was skipped and the skip spread here (see [Skipping](#skipping)). `state.skip` is `{ source, reason }`. |
 | `error` | The last run threw or rejected (`state.error`), or the node is on a dependency cycle (`state.cycle === true`). |
 
-A node queued behind upstream work keeps its previous state until it actually starts. Every state also carries `version` (settled runs), `runId` (started runs) and `stale` (a manual node whose inputs or definition changed since its last run).
+A node queued behind upstream work keeps its previous state until it actually starts. Every state also carries `version` (settled runs), `runId` (started runs), `stale` (a manual node whose inputs or definition changed since its last run, or a dependent a [held run](#partial-runs) didn't rerun) and `unchanged` (the last run returned [`UNCHANGED`](#equality-cut-off)).
 
 ## Guarantees
 
@@ -90,6 +92,7 @@ A node queued behind upstream work keeps its previous state until it actually st
 - **Errors don't cascade as errors.** When a node fails, its dependents become `waiting`, not `error`; only the node that broke shows an error, and the dependents rerun on their own once it's fixed.
 - **Manual nodes stay put.** A node with `autorun: false` keeps its last result when inputs change, and is flagged `stale: true` until you `run` it.
 - **Cycles are refused, not looped.** Every node on a cycle goes to `error` with `cycle: true` as soon as the edge is added, and comes back to `idle` when the cycle is broken.
+- **Held runs stay held.** `run(id, { follow: false })` never starts a dependent that wasn't already asked to run; see [Partial runs](#partial-runs).
 - **Skips spread, they don't stall.** A node that returns `SKIP` is `skipped`, and so is every dependent, without running, until one that declared `consumesSkip` decides what to do. Nothing changes for a graph that never skips.
 
 ## Skipping
@@ -143,11 +146,52 @@ The rules:
 - **`version` counts runs.** A node whose own run returned `SKIP` settled a run (`version` +1); a node skipped because an input was skipped didn't run (`version` unchanged, `runId` +1).
 - **Your values are yours.** The scheduler can't clear the value you stored for a node before it was skipped; drop it when `run` returns a skip (as above) or when `onChange` reports `skipped`.
 
+## Partial runs
+
+A notebook with expensive cells (an LLM call, a paged fetch, an audio render) wants finer runs than "this cell and everything that follows": run one cell and look at it before paying for the cells below, or run a cell together with whatever it needs.
+
+```js
+flow.run("prompt", { follow: false }); // only "prompt"; "answer" below it is flagged stale
+flow.runAll({ ids: ["topic", "prompt"], follow: false }); // that set, in order; everything else held
+flow.runAll({ ids: ["prompt", "answer", "shown"] }); // a one-shot "run from here", manual cells included
+```
+
+- **`follow: false` holds the run's dependents.** For that run, every dependent is treated as if it were a manual node: a `done` or `skipped` one keeps its result and is flagged `stale` (it reruns when you `run` it, or when an input changes again and it follows normally); nothing below it is touched, the same as for a manual node. `follow` defaults to `true`, which is the 0.0.1 behavior.
+- **`runAll({ ids, follow: false })`** runs exactly the nodes in `ids` (in dependency order, each once) and holds every dependent outside the set. Planning the set ("this node and its stale upstream") is the caller's: `deps(id)`, `dependents(id)`, `get(id)` and `order(ids)` have what it needs.
+- **What a hold doesn't stop.** A dependent that is `waiting` (its input had failed) was already asked to run, and runs when the input recovers, as a waiting manual node does. A dependent that is queued anyway (in the same `runAll`, or by another `run`) runs. A held run that fails makes its dependents wait, as any failure does.
+- **The request stands until the node starts.** A node asked to run held while its input is broken waits, and when it finally runs, its dependents are held. The latest request for a queued node wins (`run(id)` after `run(id, { follow: false })` follows); `reset()` forgets it.
+- **Skips are held too.** A held run that returns `SKIP` flags its done dependents `stale` instead of spreading the skip to them.
+
+## Equality cut-off
+
+The scheduler doesn't hold values, so it can't tell that a new value equals the old one; you can. Return `UNCHANGED` from `run` and the node settles `done` without rerunning what depends on it:
+
+```js
+import { createDataflow, UNCHANGED } from "@johnhenry/dataflow";
+
+const values = new Map();
+const flow = createDataflow({
+  async run(id, { deps, signal }) {
+    const value = await formulas[id](...deps.map((d) => values.get(d)));
+    if (signal.aborted) return value;
+    if (values.has(id) && Object.is(values.get(id), value)) return UNCHANGED; // your equality
+    values.set(id, value);
+    return value;
+  },
+});
+```
+
+- **What it does.** The node settles `done` with `unchanged: true`. `version` doesn't bump (no new value) and `runId` does (it was a run). `state.result` keeps the previous result; return `unchanged(result)` to replace it (a fresh preview of an equal value, say).
+- **Dependents that already ran on the value are left alone:** autorun ones don't rerun, manual ones aren't flagged `stale`, and errored ones aren't retried. Dependents that are `waiting`, or that never ran (an autorun node added after the input last changed), still run: they don't have a result for this value yet. A dependent queued for its own reasons still runs.
+- **Only after a `done`.** If the node's last settled run wasn't `done` (first run, an error, a skip, a cycle, a `reset()`), there is nothing to compare with: `UNCHANGED` counts as a new value (`result` is `undefined`, or what `unchanged(result)` carried) and propagates.
+- **Newest run wins** for it as for any result: a superseded run's `UNCHANGED` is dropped.
+- It is `Symbol.for("@johnhenry/dataflow.unchanged")`; like `SKIP` it can't cross `postMessage`, so a Worker returns its own marker and your `run` maps it.
+
 ## API
 
 ### `createDataflow({ run, onChange?, schedule? })`
 
-- `run(id, { runId, signal, deps, skipped })` -- compute one node; may return a value or a promise. `deps` is the dependency list at the moment the run started; `skipped` lists the inputs that were skipped (only ever non-empty for a node with `consumesSkip`). Return `SKIP` or `skip(reason)` to skip the node.
+- `run(id, { runId, signal, deps, skipped })` -- compute one node; may return a value or a promise. `deps` is the dependency list at the moment the run started; `skipped` lists the inputs that were skipped (only ever non-empty for a node with `consumesSkip`). Return `SKIP` or `skip(reason)` to skip the node, and `UNCHANGED` or `unchanged(result)` when the value equals the previous one.
 - `onChange(id, state)` -- called on every state change (also see `subscribe`).
 - `schedule(fn)` -- how flushes are deferred; default `queueMicrotask`.
 
@@ -157,9 +201,9 @@ Returns a graph object; mutating methods return it, so calls chain.
 | --- | --- |
 | `set(id, { deps = [], autorun = true, consumesSkip = false })` | Add a node, or replace its dependencies / autorun flag / skip handling (`true`, or the input ids it consumes skips from). Never runs anything by itself. |
 | `delete(id)` | Remove a node; its dependents start waiting. |
-| `run(id)` | Run now, whatever the autorun flag. Autorun dependents follow. |
+| `run(id, { follow = true })` | Run now, whatever the autorun flag. Autorun dependents follow; `follow: false` holds them (flagged `stale`, not run). |
 | `invalidate(id)` | The definition changed: autorun nodes rerun, manual nodes become `stale`. |
-| `runAll({ all = true, ids })` | Queue nodes in dependency order; `all: false` skips manual nodes. |
+| `runAll({ all = true, ids, follow = true })` | Queue nodes in dependency order; `all: false` skips manual nodes; `follow: false` holds dependents outside the set. |
 | `reset()` | Forget every result, abort in-flight runs (for example after the place your values live was restarted). |
 | `pause()` / `resume()` / `paused` | Hold new runs; running ones still settle. |
 | `get(id)`, `has(id)`, `deps(id)`, `autorun(id)`, `consumesSkip(id)`, `dependents(id)`, `ids()` | Read the graph. |
@@ -173,11 +217,18 @@ Returns a graph object; mutating methods return it, so calls chain.
 - `skip(reason)` -- a frozen skip that carries `reason` to `state.skip.reason` of the node and everything it spreads to.
 - `isSkip(value)` -- true for both.
 
+### `UNCHANGED`, `unchanged(result?)`, `isUnchanged(value)`
+
+- `UNCHANGED` -- return it from `run` when the new value equals the previous one; see [Equality cut-off](#equality-cut-off).
+- `unchanged(result)` -- the same, and `result` replaces `state.result`.
+- `isUnchanged(value)` -- true for both.
+
 TypeScript declarations ship in `src/index.d.ts`.
 
 ## Honest limitations
 
-- **It doesn't store values.** That is deliberate, but it means "rerun only if the value actually changed" (equality cut-off) is yours: return early from `run` and compare in `onChange` if you need it.
+- **It doesn't store or compare values.** That is deliberate, so deciding that a value didn't change (equality cut-off) is yours: compare in `run` and return [`UNCHANGED`](#equality-cut-off); the scheduler only acts on the answer.
+- **It doesn't plan partial runs.** `follow: false` holds dependents; which nodes a "run up to here" should include (stale upstream, never-run inputs) is the caller's choice, made from `deps`, `get` and `order`.
 - **Cancellation is cooperative.** A superseded run's result is dropped and its signal aborts, but the scheduler can't stop code that ignores the signal. If you need a hard kill, run in something you can terminate (a Worker) and call `reset()` after restarting it.
 - **No first-to-finish race.** Glitch-freedom means a node with skip-consuming inputs runs once all of them settled, never on the first one; see [Skipping](#skipping).
 - **Scans are linear.** Finding dependents walks every node; that is fine for hundreds or a few thousand nodes (a notebook, a spreadsheet tab), not for a million-cell sheet.

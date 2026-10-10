@@ -21,6 +21,7 @@ Zero dependencies. ESM. Runs in browsers, Workers and Node.
 - [Skipping](#skipping)
 - [Partial runs](#partial-runs)
 - [Equality cut-off](#equality-cut-off)
+- [Live nodes](#live-nodes)
 - [API](#api)
 - [Honest limitations](#honest-limitations)
 - [Family](#family)
@@ -32,7 +33,7 @@ Zero dependencies. ESM. Runs in browsers, Workers and Node.
 npm install @johnhenry/dataflow
 ```
 
-**Provenance:** a new package, never published under another name. Under npm's caret rules `^0.0.0` matches only `0.0.0` (and `^0.0.1` only `0.0.1`), so pin exactly until a deliberate `0.1.0`; skip values need `0.0.1`.
+**Provenance:** a new package, never published under another name. Under npm's caret rules `^0.0.0` matches only `0.0.0` (and `^0.0.1` only `0.0.1`), so pin exactly until a deliberate `0.1.0`; skip values need `0.0.1`, held runs and `UNCHANGED` `0.0.2`, live nodes `0.0.3`.
 
 ## Quick start
 
@@ -83,7 +84,7 @@ Runnable, self-verifying versions are in [`examples/`](examples/).
 | `skipped` | The last run returned `SKIP` / `skip(reason)`, or an input was skipped and the skip spread here (see [Skipping](#skipping)). `state.skip` is `{ source, reason }`. |
 | `error` | The last run threw or rejected (`state.error`), or the node is on a dependency cycle (`state.cycle === true`). |
 
-A node queued behind upstream work keeps its previous state until it actually starts. Every state also carries `version` (settled runs), `runId` (started runs), `stale` (a manual node whose inputs or definition changed since its last run, or a dependent a [held run](#partial-runs) didn't rerun) and `unchanged` (the last run returned [`UNCHANGED`](#equality-cut-off)).
+A node queued behind upstream work keeps its previous state until it actually starts. Every state also carries `version` (settles), `runId` (started runs), `stale` (a manual node whose inputs or definition changed since its last run, or a dependent a [held run](#partial-runs) didn't rerun), `unchanged` (the last run returned [`UNCHANGED`](#equality-cut-off)) and `live` (the run is [live](#live-nodes): it settles more than once).
 
 ## Guarantees
 
@@ -94,6 +95,7 @@ A node queued behind upstream work keeps its previous state until it actually st
 - **Cycles are refused, not looped.** Every node on a cycle goes to `error` with `cycle: true` as soon as the edge is added, and comes back to `idle` when the cycle is broken.
 - **Held runs stay held.** `run(id, { follow: false })` never starts a dependent that wasn't already asked to run; see [Partial runs](#partial-runs).
 - **Skips spread, they don't stall.** A node that returns `SKIP` is `skipped`, and so is every dependent, without running, until one that declared `consumesSkip` decides what to do. Nothing changes for a graph that never skips.
+- **Live sources stay glitch-free and paced.** A [live](#live-nodes) node between settles isn't busy, so a diamond below it sees one consistent version per item; a live iterable is pulled only after everything downstream of its previous item settled.
 
 ## Skipping
 
@@ -187,11 +189,95 @@ const flow = createDataflow({
 - **Newest run wins** for it as for any result: a superseded run's `UNCHANGED` is dropped.
 - It is `Symbol.for("@johnhenry/dataflow.unchanged")`; like `SKIP` it can't cross `postMessage`, so a Worker returns its own marker and your `run` maps it.
 
+## Live nodes
+
+Some values change by themselves: a clock, a socket, a sensor, a file watch, a model streaming tokens. Rerunning the producer for each new value is wrong (it would reconnect every time); a **live run** settles more than once instead. Each settle is a new value of the node: `version` +1, `state.result` updated, dependents run as for any settle. Live runs are **opt-in**: nothing changes for a graph that doesn't ask for one, and an async iterable returned as a plain value (a `ReadableStream`, a generator object) stays a plain value.
+
+```js
+const flow = createDataflow({
+  async *run(id, ctx) {
+    // `run` is an async generator function itself, so every run is live.
+    // Any other `run` opts in per run: `return live(iterable)`.
+    const socket = connect(feeds[id], { signal: ctx.signal }); // stops iterating when the signal aborts
+    try {
+      for await (const message of socket) yield message; // each item settles the node
+    } finally {
+      socket.close(); // runs when the run is superseded, reset or deleted, or the feed ends
+    }
+  },
+});
+```
+
+A run goes live in either of two ways, or both:
+
+- **Return `live(iterable)`** (pull form), or make `run` itself an `async function*`. Each item settles the node: a value settles `done`, `SKIP` / `skip(reason)` settles `skipped` (and spreads), `UNCHANGED` / `unchanged(result)` works as it does when returned. A thrown error settles `error` and ends the run. When the iterable finishes the run ends; one that finishes without an item settles `done` with `result: undefined`, like a function that returns nothing. Its `{ done: true }` value is ignored, as `for await` ignores it.
+- **Call `ctx.emit(result)`** (push form, for callback sources). It settles the node right away, exactly like an item, and returns `true`; it returns `false` and does nothing once the run was superseded, reset, deleted, closed or ended. The run stays live until its promise resolves, `ctx.close()` is called, or it errors. Once a run has emitted, its resolved value no longer settles anything: resolving just ends it (emit the last value before returning). A run may emit and then return `live(iterable)`, which takes over.
+
+```js
+async run(id, { emit, signal }) {
+  const source = new EventSource(urls[id]);
+  source.onmessage = (event) => emit(event.data);
+  await new Promise((resolve) => signal.addEventListener("abort", resolve)); // stay live
+  source.close();
+}
+```
+
+**`state.live`** is `true` while the run is open, in `get(id)` and in every `onChange`. The status keeps its meaning: `running` until the first settle (dependents wait for it, as for any run), then the status of the last settle. `runId` stays the same across a live run's settles; `version` counts them.
+
+### Backpressure
+
+A live iterable is pulled for its next item only once **everything downstream of its previous item has settled**: no node downstream of it (transitively, not just its direct dependents) is queued to run or `running`. It is the glitch-freedom rule (`upstreamBusy`) applied downstream, and it means a burst from a fast producer reaches the graph one item at a time, each one through the whole graph, with no run superseded and nothing buffered in the scheduler (the producer waits at its `yield`). Precisely, a downstream node counts as settled when it is:
+
+- `done`, `skipped`, `error`, `waiting` or `idle` and not queued. A `waiting` dependent (an input failed) and an errored one don't hold the producer.
+- **Manual** (`autorun: false`): it is flagged `stale`, not queued, so it never holds the producer.
+- **Held:** a [held](#partial-runs) live run (`run(id, { follow: false })`) flags its dependents `stale` on every settle instead of running them, so nothing holds it: it is pulled as fast as it yields.
+- **Live itself:** a live dependent between settles isn't busy. One that hasn't settled yet in its current run is `running`, so it holds the producer until its first settle. (A live `resume` dependent that waits for a change before its first settle would therefore wait forever: settle once first.)
+- **A `resume` dependent** counts as settled once it has been told about the change (see below): what it does with the notice is its own business, and its notices coalesce.
+
+The first item is pulled as soon as the iterable is returned (it is the run's own result). While the graph is `pause()`d no item is pulled; emits still settle, as running runs still do. `ctx.emit` has no backpressure: each emit settles at once, and dependents still running on an older emit are superseded (newest wins), so a burst of emits coalesces downstream to the latest.
+
+### Glitch-freedom
+
+A live node between settles isn't busy, so it doesn't block its dependents; each settle starts a normal wave. In a diamond (`live → b`, `live → c`, `b + c → d`) with a live source, `d` runs once per item, after both `b` and `c` saw that item: one consistent version per settle. With `emit`, a newer value supersedes the wave still in flight, and the join still never mixes versions.
+
+### Ending a live run: supersede, reset, delete
+
+A newer run of the node (an explicit `run`, or an input change, which restarts it by default), `reset()`, `delete(id)`, an input that fails (the node waits) or a skip spreading onto it all end the live run: its `AbortSignal` aborts **and** its iterable's `return()` is called, so an async generator's `finally` runs. Items and emits that arrive later are dropped (`emit` returns `false`). A `live(...)` iterable returned by a run that was already superseded is closed unread (a plain value is dropped untouched, as always).
+
+`return()` reaches a generator only at a `yield`. One that is held by backpressure is at a `yield`, so its `finally` runs at once; one that is awaiting something (the next socket message) runs it when that await ends, so make long waits follow `ctx.signal` (as `readings()` does in [`examples/06-live-nodes.mjs`](examples/06-live-nodes.mjs), or with `abortable()` from `@johnhenry/iteration`). `ctx.close()` ends the run from inside: later emits are refused and an open iterable is closed, but the signal doesn't abort (it is an end, not a cancellation). Errors thrown by a producer's cleanup are dropped, like the rejection of any superseded run.
+
+### Resume instead of restart
+
+By default an input change restarts a live run, like any run: the old one is closed and `run` is called again. A node set with **`resume: true`** keeps its live run instead, and the run is told about the change:
+
+```js
+flow.set("total", { deps: ["amount"], resume: true });
+
+async *run(id, ctx) {
+  let total = values.get("amount");
+  yield total;
+  for await (const change of ctx.changes) {
+    // change: { deps, skipped, changed: ["amount"] }
+    total += values.get("amount");
+    yield total; // a running total no restart could keep
+  }
+}
+```
+
+- **`ctx.changes`** is an async iterable of change notices `{ deps, skipped, changed }`: the node's dependencies now, the skipped inputs (for a `consumesSkip` node), and the inputs that settled since the last notice. It is a mailbox of one, **coalesced, latest wins**: notices that arrive before the run takes the previous one merge into one (latest `deps` and `skipped`, `changed` merged), and they are kept from the moment the run starts, so a generator that starts listening after its first `yield` misses nothing. It is meant for one consumer, and it ends when the run ends (a `for await` over it then simply finishes). For a node without `resume` it never yields.
+- **`ctx.onChange(fn)`** is the callback form: `fn(notice)` for every notice (not coalesced), returning an unsubscribe function; a throwing callback is reported like a throwing listener. It suits the `emit` form: `ctx.onChange(() => emit(recompute()))`.
+- Notices follow the same rules as runs: one per upstream wave, only once nothing upstream is busy (glitch-free), after the change actually reaches the node (a manual node is flagged `stale`, a held one too; an `UNCHANGED` input doesn't notify).
+- **What still restarts it:** a run that isn't live yet (it hasn't emitted or returned a live iterable), an explicit `run(id)` / `runAll(...)`, and `invalidate(id)` (a new definition). **What ends it:** an input that fails (the node waits) or a skip spreading onto it, as for any node.
+
+**Why a node option.** Restart or resume is a property of the node (the caller knows, per cell, whether its code is written to resume), and the scheduler has to know it before the change arrives, to decide between superseding the run and notifying it; a flag the handler sets would make that decision depend on how far the run had got. As an option it sits with `autorun` and `consumesSkip`, can be read back (`resumes(id)`; `resume()` already un-pauses the graph), and changes with `set` like them. `ctx.changes` and `ctx.onChange` are on every run, so the handler needs no flag of its own.
+
+The scheduler still stores and compares no values: a notice says which inputs changed, not what to; the run reads them wherever they live.
+
 ## API
 
 ### `createDataflow({ run, onChange?, schedule? })`
 
-- `run(id, { runId, signal, deps, skipped })` -- compute one node; may return a value or a promise. `deps` is the dependency list at the moment the run started; `skipped` lists the inputs that were skipped (only ever non-empty for a node with `consumesSkip`). Return `SKIP` or `skip(reason)` to skip the node, and `UNCHANGED` or `unchanged(result)` when the value equals the previous one.
+- `run(id, { runId, signal, deps, skipped, emit, close, changes, onChange })` -- compute one node; may return a value or a promise. `deps` is the dependency list at the moment the run started; `skipped` lists the inputs that were skipped (only ever non-empty for a node with `consumesSkip`). Return `SKIP` or `skip(reason)` to skip the node, and `UNCHANGED` or `unchanged(result)` when the value equals the previous one. Return `live(iterable)` (or make `run` an `async function*`), or call `emit(result)`, for a [live run](#live-nodes); `close()` ends it; `changes` / `onChange(fn)` deliver change notices to a live `resume` node.
 - `onChange(id, state)` -- called on every state change (also see `subscribe`).
 - `schedule(fn)` -- how flushes are deferred; default `queueMicrotask`.
 
@@ -199,17 +285,17 @@ Returns a graph object; mutating methods return it, so calls chain.
 
 | Method | Does |
 | --- | --- |
-| `set(id, { deps = [], autorun = true, consumesSkip = false })` | Add a node, or replace its dependencies / autorun flag / skip handling (`true`, or the input ids it consumes skips from). Never runs anything by itself. |
+| `set(id, { deps = [], autorun = true, consumesSkip = false, resume = false })` | Add a node, or replace its dependencies / autorun flag / skip handling (`true`, or the input ids it consumes skips from) / [resume](#resume-instead-of-restart) flag. Never runs anything by itself. |
 | `delete(id)` | Remove a node; its dependents start waiting. |
 | `run(id, { follow = true })` | Run now, whatever the autorun flag. Autorun dependents follow; `follow: false` holds them (flagged `stale`, not run). |
 | `invalidate(id)` | The definition changed: autorun nodes rerun, manual nodes become `stale`. |
 | `runAll({ all = true, ids, follow = true })` | Queue nodes in dependency order; `all: false` skips manual nodes; `follow: false` holds dependents outside the set. |
-| `reset()` | Forget every result, abort in-flight runs (for example after the place your values live was restarted). |
-| `pause()` / `resume()` / `paused` | Hold new runs; running ones still settle. |
-| `get(id)`, `has(id)`, `deps(id)`, `autorun(id)`, `consumesSkip(id)`, `dependents(id)`, `ids()` | Read the graph. |
+| `reset()` | Forget every result, abort in-flight runs and close live ones (for example after the place your values live was restarted). |
+| `pause()` / `resume()` / `paused` | Hold new runs and live pulls; running ones still settle (and emit). |
+| `get(id)`, `has(id)`, `deps(id)`, `autorun(id)`, `consumesSkip(id)`, `resumes(id)`, `dependents(id)`, `ids()` | Read the graph. `resumes(id)` is the `resume` option. |
 | `order(ids?)` | Topological order, dependencies first; nodes on a cycle are omitted. |
 | `subscribe(fn)` | Listen to every change; returns an unsubscribe function. A listener that throws is reported (`reportError`) and affects neither other listeners nor scheduling, like an `EventTarget` listener. |
-| `idle()` | Resolves once nothing is queued or running (or the graph is paused). |
+| `idle()` | Resolves once nothing is queued or running (or the graph is paused). A live node between settles isn't running, so `idle()` doesn't wait for an open stream; one that hasn't settled yet in its run is, and it does. |
 
 ### `SKIP`, `skip(reason?)`, `isSkip(value)`
 
@@ -223,6 +309,12 @@ Returns a graph object; mutating methods return it, so calls chain.
 - `unchanged(result)` -- the same, and `result` replaces `state.result`.
 - `isUnchanged(value)` -- true for both.
 
+### `live(iterable)`, `isLive(value)`, `LIVE`
+
+- `live(iterable)` -- return it from `run` to make the run [live](#live-nodes): each item of the async iterable settles the node. A frozen marker (`{ [LIVE]: true, iterable }`), so it is opt-in: an async iterable returned without it is a plain value. Throws a `TypeError` for anything that isn't an async iterable. A `run` that is itself an `async function*` needs no marker.
+- `isLive(value)` -- true for what `live` returns.
+- `LIVE` -- `Symbol.for("@johnhenry/dataflow.live")`; like `SKIP` it can't cross `postMessage`, so a Worker returns its own marker and your `run` calls `live(...)` on the page.
+
 TypeScript declarations ship in `src/index.d.ts`.
 
 ## Honest limitations
@@ -231,6 +323,8 @@ TypeScript declarations ship in `src/index.d.ts`.
 - **It doesn't plan partial runs.** `follow: false` holds dependents; which nodes a "run up to here" should include (stale upstream, never-run inputs) is the caller's choice, made from `deps`, `get` and `order`.
 - **Cancellation is cooperative.** A superseded run's result is dropped and its signal aborts, but the scheduler can't stop code that ignores the signal. If you need a hard kill, run in something you can terminate (a Worker) and call `reset()` after restarting it.
 - **No first-to-finish race.** Glitch-freedom means a node with skip-consuming inputs runs once all of them settled, never on the first one; see [Skipping](#skipping).
+- **Live producers must cooperate.** A producer that yields forever without ever awaiting anything that takes a turn of the event loop (a timer, I/O) starves it, as any endless async loop does; and `return()` reaches an async generator only at a `yield`, so a long await should follow `ctx.signal` for cleanup to be prompt. A shared source that two runs read in turn (a queue) can hand an item to a run that is about to be superseded; the scheduler drops that run's late items, it can't give them to the next run.
+- **Generator functions are recognized only natively.** A `run` that is itself an `async function*` (a method or a bound one too) is live without the marker; the scheduler tells it from an ordinary function by its built-in type tag. A function that returns a generator, a wrapper around one, or a generator transpiled to plain functions can't be told apart, so it returns `live(iterable)` like any other `run`.
 - **Scans are linear.** Finding dependents walks every node; that is fine for hundreds or a few thousand nodes (a notebook, a spreadsheet tab), not for a million-cell sheet.
 - **One process.** The graph is in-memory and not shared across tabs or machines.
 

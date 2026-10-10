@@ -1,7 +1,7 @@
 {
   "name": "@johnhenry/dataflow",
-  "version": "0.0.2",
-  "description": "An async dataflow scheduler: nodes that depend on other nodes, run by your async function, with glitch-free propagation, stale-run cancellation, skip values and per-node run states. Values live wherever you keep them.",
+  "version": "0.0.3",
+  "description": "An async dataflow scheduler: nodes that depend on other nodes, run by your async function, with glitch-free propagation, stale-run cancellation, skip values, live nodes and per-node run states. Values live wherever you keep them.",
   "type": "module",
   "main": "src/index.mjs",
   "types": "src/index.d.ts",
@@ -26,7 +26,8 @@
     "example:02": "node examples/02-a-slow-stale-run-never-overwrites-a-newer-one.mjs",
     "example:03": "node examples/03-errors-make-dependents-wait-not-fail.mjs",
     "example:04": "node examples/04-skip-values.mjs",
-    "example:05": "node examples/05-partial-runs-and-unchanged.mjs"
+    "example:05": "node examples/05-partial-runs-and-unchanged.mjs",
+    "example:06": "node examples/06-live-nodes.mjs"
   },
   "keywords": [
     "dataflow",
@@ -37,7 +38,9 @@
     "async",
     "dependency-graph",
     "cancellation",
-    "control-flow"
+    "control-flow",
+    "async-iterator",
+    "backpressure"
   ],
   "author": "John Henry",
   "license": "MIT",

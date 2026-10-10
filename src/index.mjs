@@ -21,6 +21,12 @@
  * running (no glitches: a diamond's join runs once per upstream change); a
  * newer run supersedes an older one (the older result is dropped and its
  * AbortSignal fires); errors do not cascade as errors (dependents wait).
+ *
+ * Partial runs: `run(id, { follow: false })` / `runAll({ ids, follow: false })`
+ * hold the run's dependents (they are treated like manual nodes for that run:
+ * flagged `stale`, not run). Equality cut-off: a `run` that returns
+ * `UNCHANGED` (the caller compared its own values) settles `done` without
+ * rerunning dependents that already saw that value.
  */
 
 /**
@@ -41,6 +47,25 @@ export function isSkip(value) {
   return value === SKIP || (typeof value === "object" && value !== null && value[SKIP] === true);
 }
 
+/**
+ * Return this from `run` when the caller decided the node's new value equals
+ * its previous one. The node settles `done` with `unchanged: true`, `version`
+ * stays, and dependents that already ran on the value aren't rerun or flagged
+ * stale. If the node's last settled run wasn't `done` there is nothing to
+ * compare with, and it counts as a new value. `Symbol.for`, like `SKIP`.
+ */
+export const UNCHANGED = Symbol.for("@johnhenry/dataflow.unchanged");
+
+/** Like returning `UNCHANGED`, with a `result` for `state.result` (instead of keeping the previous one). */
+export function unchanged(result) {
+  return Object.freeze({ [UNCHANGED]: true, result });
+}
+
+/** True for `UNCHANGED` and for what `unchanged(result)` returns. */
+export function isUnchanged(value) {
+  return value === UNCHANGED || (typeof value === "object" && value !== null && value[UNCHANGED] === true);
+}
+
 const normalizeConsumes = (consumesSkip) => (Array.isArray(consumesSkip) ? [...new Set(consumesSkip)] : Boolean(consumesSkip));
 
 /**
@@ -53,7 +78,12 @@ const normalizeConsumes = (consumesSkip) => (Array.isArray(consumesSkip) ? [...n
 export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}) {
   if (typeof run !== "function") throw new TypeError("createDataflow: `run` must be a function");
 
-  /** @type {Map<string, { deps: string[], autorun: boolean, consumesSkip: boolean | string[], state: any, controller?: AbortController }>} */
+  /**
+   * `follow`: how the next run of a queued node treats its dependents (set by
+   * `run` / `runAll`, kept until the node starts; absent means follow).
+   * `settledDone`: the last settled outcome was `done` (UNCHANGED compares with it).
+   * @type {Map<string, { deps: string[], autorun: boolean, consumesSkip: boolean | string[], state: any, controller?: AbortController, follow?: boolean, runFollow?: boolean, settledDone?: boolean }>}
+   */
   const nodes = new Map();
   const pending = new Set();
   const listeners = new Set();
@@ -136,6 +166,8 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
         node.controller?.abort();
         node.controller = undefined;
         pending.delete(id);
+        delete node.follow;
+        node.settledDone = false;
         setState(id, {
           status: "error",
           cycle: true,
@@ -228,7 +260,9 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
       const skippedDeps = node.deps.filter((dep) => nodes.get(dep).state.status === "skipped");
       const spreading = skippedDeps.find((dep) => !consumes(node, dep));
       if (spreading !== undefined) {
-        spreadSkip(id, nodes.get(spreading).state.skip);
+        const follow = node.follow ?? true;
+        delete node.follow;
+        spreadSkip(id, nodes.get(spreading).state.skip, follow);
         continue;
       }
       start(id, skippedDeps);
@@ -241,7 +275,9 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     const controller = new AbortController();
     node.controller = controller;
     const runId = node.state.runId + 1;
-    setState(id, { status: "running", runId, stale: false });
+    node.runFollow = node.follow ?? true;
+    delete node.follow;
+    setState(id, { status: "running", runId, stale: false, unchanged: false });
     let result;
     try {
       result = Promise.resolve(run(id, { runId, signal: controller.signal, deps: [...node.deps], skipped }));
@@ -249,43 +285,75 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
       result = Promise.reject(error);
     }
     result.then(
-      (value) =>
-        isSkip(value)
-          ? settle(id, runId, { status: "skipped", result: undefined, error: undefined, skip: Object.freeze({ source: id, reason: value === SKIP ? undefined : value.reason }) })
-          : settle(id, runId, { status: "done", result: value, error: undefined }),
+      (value) => {
+        if (isSkip(value)) settle(id, runId, { status: "skipped", result: undefined, error: undefined, skip: Object.freeze({ source: id, reason: value === SKIP ? undefined : value.reason }) });
+        else if (isUnchanged(value)) settleUnchanged(id, runId, value);
+        else settle(id, runId, { status: "done", result: value, error: undefined });
+      },
       (error) => settle(id, runId, { status: "error", error, result: undefined }),
     );
   }
 
-  function settle(id, runId, patch) {
+  const current = (id, runId) => {
     const node = nodes.get(id);
-    if (!node || node.state.runId !== runId || node.state.status !== "running") return; // superseded
+    return node && node.state.runId === runId && node.state.status === "running" ? node : undefined; // else superseded
+  };
+
+  function settle(id, runId, patch) {
+    const node = current(id, runId);
+    if (!node) return;
     node.controller = undefined;
+    node.settledDone = patch.status === "done";
     setState(id, { ...patch, version: node.state.version + 1 });
-    propagate(id, patch.status === "error");
+    propagate(id, patch.status === "error", { follow: node.runFollow });
+  }
+
+  // The caller says the value didn't change. Only meaningful after a `done`:
+  // otherwise there is nothing to compare with, and it is a new value.
+  function settleUnchanged(id, runId, value) {
+    const node = current(id, runId);
+    if (!node) return;
+    const result = value === UNCHANGED ? undefined : value.result;
+    if (!node.settledDone) {
+      settle(id, runId, { status: "done", result, error: undefined });
+      return;
+    }
+    node.controller = undefined;
+    const patch = { status: "done", error: undefined, unchanged: true };
+    if (value !== UNCHANGED) patch.result = result;
+    setState(id, patch);
+    propagate(id, false, { follow: node.runFollow, unchanged: true });
   }
 
   // An input was skipped and this node doesn't consume it: skip without
   // running. Nothing ran, so `version` stays; `runId` bumps so that a run of
   // this node still in flight is dropped when it settles.
-  function spreadSkip(id, from) {
+  function spreadSkip(id, from, follow = true) {
     const node = nodes.get(id);
     node.controller?.abort();
     node.controller = undefined;
-    setState(id, { status: "skipped", runId: node.state.runId + 1, result: undefined, error: undefined, stale: false, skip: from });
-    propagate(id, false);
+    node.settledDone = false;
+    setState(id, { status: "skipped", runId: node.state.runId + 1, result: undefined, error: undefined, stale: false, unchanged: false, skip: from });
+    propagate(id, false, { follow });
   }
 
   // A node has a new outcome; tell its dependents.
-  function propagate(id, failed) {
+  //  follow: false   a held run: every dependent is treated like a manual node
+  //                  (flagged stale, not run; a waiting or queued one still runs).
+  //  unchanged: true the value didn't change: dependents that already ran on
+  //                  it (or failed on it) are left alone; waiting and never-run
+  //                  autorun ones still run.
+  function propagate(id, failed, { follow = true, unchanged = false } = {}) {
     for (const dep of dependents(id)) {
       const d = nodes.get(dep);
       if (!d || d.state.cycle) continue;
+      if (unchanged && d.state.status !== "waiting" && d.state.status !== "idle") continue;
       if (failed) {
         markWaiting(dep);
         for (const down of downstream(dep)) markWaiting(down);
-      } else if (d.autorun || d.state.status === "waiting") {
-        // Autorun nodes follow their inputs; a waiting node was already asked to run.
+      } else if ((follow && d.autorun) || d.state.status === "waiting" || pending.has(dep)) {
+        // Autorun nodes follow their inputs (unless the run is held); a waiting
+        // node was already asked to run; a queued one runs anyway.
         pending.add(dep);
       } else if (d.state.status === "done" || d.state.status === "skipped") {
         setState(dep, { stale: true });
@@ -309,7 +377,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
           deps: unique,
           autorun: Boolean(autorun),
           consumesSkip: normalizeConsumes(consumesSkip),
-          state: { status: "idle", version: 0, runId: 0, stale: false, cycle: false },
+          state: { status: "idle", version: 0, runId: 0, stale: false, unchanged: false, cycle: false },
         });
         emit(id);
       }
@@ -345,9 +413,14 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     order: (ids) => order(ids),
     ids: () => [...nodes.keys()],
 
-    /** Run a node now, whatever its autorun flag. Autorun dependents follow. */
-    run(id) {
-      if (!nodes.has(id)) return api;
+    /**
+     * Run a node now, whatever its autorun flag. Autorun dependents follow,
+     * unless `follow: false`: then they are held (flagged stale, not run).
+     */
+    run(id, { follow = true } = {}) {
+      const node = nodes.get(id);
+      if (!node) return api;
+      node.follow = Boolean(follow);
       pending.add(id);
       queueFlush();
       return api;
@@ -366,9 +439,17 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
       return api;
     },
 
-    /** Queue every node (or `ids`) in dependency order. `all: false` skips manual nodes. */
-    runAll({ all = true, ids } = {}) {
-      for (const id of order(ids)) if (all || nodes.get(id).autorun) pending.add(id);
+    /**
+     * Queue every node (or `ids`) in dependency order. `all: false` skips
+     * manual nodes. `follow: false` holds dependents outside the queued set.
+     */
+    runAll({ all = true, ids, follow = true } = {}) {
+      for (const id of order(ids)) {
+        const node = nodes.get(id);
+        if (!all && !node.autorun) continue;
+        node.follow = Boolean(follow);
+        pending.add(id);
+      }
       queueFlush();
       return api;
     },
@@ -379,8 +460,10 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
       for (const [id, node] of nodes) {
         node.controller?.abort();
         node.controller = undefined;
+        delete node.follow;
+        node.settledDone = false;
         if (node.state.cycle) continue;
-        node.state = { ...node.state, status: "idle", result: undefined, error: undefined, stale: false, runId: node.state.runId + 1 };
+        node.state = { ...node.state, status: "idle", result: undefined, error: undefined, stale: false, unchanged: false, runId: node.state.runId + 1 };
         delete node.state.skip;
         emit(id);
       }

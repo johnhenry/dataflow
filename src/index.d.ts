@@ -18,6 +18,24 @@ export function skip(reason?: unknown): SkipWithReason;
 /** True for `SKIP` and for what `skip(reason)` returns. */
 export function isSkip(value: unknown): value is Skip;
 
+/** Return this from `run` when the new value equals the previous one (the caller compares). `Symbol.for("@johnhenry/dataflow.unchanged")`. */
+export const UNCHANGED: unique symbol;
+
+/** What `unchanged(result)` returns: an unchanged value that also replaces `state.result`. */
+export interface UnchangedWithResult<R = unknown> {
+  readonly [UNCHANGED]: true;
+  readonly result: R;
+}
+
+/** Anything `run` can return to say "same value as before": `UNCHANGED` or `unchanged(result)`. */
+export type Unchanged<R = unknown> = typeof UNCHANGED | UnchangedWithResult<R>;
+
+/** An unchanged value whose `result` replaces `state.result` (a bare `UNCHANGED` keeps the previous one). */
+export function unchanged<R>(result: R): UnchangedWithResult<R>;
+
+/** True for `UNCHANGED` and for what `unchanged(result)` returns. */
+export function isUnchanged(value: unknown): value is Unchanged;
+
 /** Why a node is skipped (present only while `status === "skipped"`). */
 export interface SkipInfo {
   /** The node whose run returned the skip (the node itself, or the upstream node it spread from). */
@@ -39,8 +57,16 @@ export interface NodeState<R = unknown> {
   skip?: SkipInfo;
   /** The last rejection reason, or the cycle error. */
   error?: unknown;
-  /** A manual (non-autorun) node whose inputs or definition changed since its last run. */
+  /**
+   * A manual (non-autorun) node whose inputs or definition changed since its
+   * last run, or a dependent held by a `follow: false` run.
+   */
   stale: boolean;
+  /**
+   * The last run returned `UNCHANGED` (after a `done` run): `version` didn't
+   * bump and dependents weren't rerun. Cleared when the next run starts.
+   */
+  unchanged: boolean;
   /** True while the node sits on a dependency cycle. */
   cycle: boolean;
 }
@@ -57,8 +83,12 @@ export interface RunContext {
 }
 
 export interface DataflowOptions<R = unknown> {
-  /** Compute one node. May return a value or a promise; return `SKIP` or `skip(reason)` to skip the node. */
-  run: (id: string, ctx: RunContext) => R | Skip | Promise<R | Skip>;
+  /**
+   * Compute one node. May return a value or a promise; return `SKIP` or
+   * `skip(reason)` to skip the node, `UNCHANGED` or `unchanged(result)` when
+   * the value equals the previous one.
+   */
+  run: (id: string, ctx: RunContext) => R | Skip | Unchanged<R> | Promise<R | Skip | Unchanged<R>>;
   /** Called on every state change of every node. */
   onChange?: (id: string, state: NodeState<R>) => void;
   /** How flushes are deferred. Default `queueMicrotask`. */
@@ -79,6 +109,24 @@ export interface NodeOptions {
   consumesSkip?: boolean | string[];
 }
 
+export interface RunOptions {
+  /**
+   * Whether autorun dependents follow this run. Default `true`. With `false`
+   * every dependent that isn't queued itself is treated like a manual node for
+   * this run: a done or skipped one keeps its result and is flagged `stale`;
+   * a waiting one (already asked to run) still runs. The request stands until
+   * the node starts, so a node waiting on a broken input keeps it.
+   */
+  follow?: boolean;
+}
+
+export interface RunAllOptions extends RunOptions {
+  /** `false` skips manual nodes. Default `true`. */
+  all?: boolean;
+  /** Only these nodes (still in dependency order). Default: every node. */
+  ids?: string[];
+}
+
 export interface Dataflow<R = unknown> {
   set(id: string, options?: NodeOptions): this;
   delete(id: string): this;
@@ -91,9 +139,11 @@ export interface Dataflow<R = unknown> {
   /** Topological order (dependencies first); nodes on a cycle are left out. */
   order(ids?: string[]): string[];
   ids(): string[];
-  run(id: string): this;
+  /** Run now, whatever the autorun flag. `follow: false` holds the dependents (flagged stale, not run). */
+  run(id: string, options?: RunOptions): this;
   invalidate(id: string): this;
-  runAll(options?: { all?: boolean; ids?: string[] }): this;
+  /** Queue every node (or `ids`) in dependency order. `follow: false` holds dependents outside the set. */
+  runAll(options?: RunAllOptions): this;
   reset(): this;
   pause(): this;
   resume(): this;

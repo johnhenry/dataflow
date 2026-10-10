@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.2 (2026-10-10)
+
+Held runs and a caller-decided equality cut-off (#4, this PR; motivated by johnhenry/miso#43 and johnhenry/miso#48). Additive: a graph that uses neither behaves exactly as in 0.0.1.
+
+- **Held runs: `run(id, { follow: false })` and `runAll({ ids, follow: false })`.** The run's dependents are treated like manual nodes for that run: a done or skipped one keeps its result and is flagged `stale`, none starts. A waiting dependent (already asked to run) and a dependent queued anyway still run; a held run that fails still makes dependents wait; a held run that skips flags its dependents stale instead of spreading. The request stands until the node starts (it survives a wait on a broken input); the latest request wins; `reset()` forgets it. `follow` defaults to `true`. This is what a notebook needs for "run only this cell" and "run up to here" (the caller plans the set from `deps`, `get` and `order`).
+- **`UNCHANGED`, `unchanged(result)`, `isUnchanged(value)`.** A `run` that returns `UNCHANGED` (the caller compared its own values) settles `done` with the new **`state.unchanged: true`**; `version` stays, `runId` bumps, `state.result` is kept (or replaced by `unchanged(result)`), and dependents that already ran on the value aren't rerun or flagged stale. Waiting and never-run autorun dependents still run. After anything but a `done` (first run, error, skip, cycle, `reset()`) there is nothing to compare with and it counts as a new value. The scheduler still stores and compares no values.
+- **`NodeState.unchanged`** is new (`false` unless the last run returned `UNCHANGED`); `stale` now also marks a dependent a held run didn't rerun. Types: `RunOptions`, `RunAllOptions`, `Unchanged`, `UnchangedWithResult`; `run`'s return type admits `Unchanged<R>`.
+- New example `examples/05-partial-runs-and-unchanged.mjs`; README sections "Partial runs" and "Equality cut-off"; Honest limitations updated (equality and partial-run planning stay the caller's).
+- **Upgrading:** under npm's caret rules `^0.0.1` matches only `0.0.1`; change the range to `^0.0.2` (or `0.0.2`).
+
 ## 0.0.1 (2026-10-10)
 
 Skip values (#2; motivated by johnhenry/miso#5, inspired by Rivet's control-flow-excluded values). Additive: a graph that never skips behaves exactly as in 0.0.0.

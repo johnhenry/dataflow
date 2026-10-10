@@ -2,7 +2,7 @@
 
 ## 0.0.3 (2026-10-10)
 
-Live nodes: runs that settle more than once, with an opt-in resume (#6, this PR; designed in johnhenry/miso#94). Additive: a graph whose runs never return an async iterable or call `ctx.emit` produces the same `onChange` sequence as 0.0.2 (every state now also carries `live: false`).
+Live nodes: runs that settle more than once, with an opt-in resume (#6, #7; designed in johnhenry/miso#94). Additive: a graph whose runs never return an async iterable or call `ctx.emit` produces the same `onChange` sequence as 0.0.2 (every state now also carries `live: false`).
 
 - **A `run` that returns an async iterable is live.** Each item settles the node (`version` +1, `state.result`, dependents run); `SKIP` / `skip(reason)` items settle `skipped`, `UNCHANGED` / `unchanged(result)` items work as when returned, a thrown error settles `error` and ends the run. `run` can be an `async function*` itself.
 - **`ctx.emit(result)`** settles the node from inside a run (push form, no backpressure) and returns `false` once the run is superseded, reset, deleted, closed or ended. The run stays live until its promise resolves (its resolved value then doesn't settle again) or **`ctx.close()`**.

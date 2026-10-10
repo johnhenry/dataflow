@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.1 (2026-10-10)
+
+Skip values (#2; motivated by johnhenry/miso#5, inspired by Rivet's control-flow-excluded values). Additive: a graph that never skips behaves exactly as in 0.0.0.
+
+- **`SKIP`, `skip(reason)`, `isSkip(value)`.** A `run` that returns `SKIP` (or `skip(reason)`, sync or async) settles its node as the new status **`skipped`**, with `state.skip = { source, reason }`.
+- **Skips spread.** Dependents of a skipped node become `skipped` without running (same `source` and `reason`); in a diamond the join is decided once. A spread skip isn't a run: `version` stays, `runId` bumps, and an in-flight run of that node is aborted and dropped.
+- **Consumers.** `set(id, { consumesSkip: true })` (or a list of input ids) runs the node anyway; `ctx.skipped` lists the skipped inputs (`[]` otherwise). Coalesce and if/else are documented patterns; there is no first-to-finish race, by glitch-freedom.
+- **Unchanged rules, extended:** errors, missing and never-run inputs still make dependents wait, and win over a skip; manual nodes keep their result and turn `stale` (a skipped manual node too); newest run wins for skips; cycles and `reset()` clear skip info; a skipped chain reruns normally once its source produces a value.
+- New `consumesSkip(id)` reader; `Status` gains `"skipped"` (a TypeScript `switch` over `Status` that checks exhaustiveness needs a case for it).
+- **Upgrading:** under npm's caret rules `^0.0.0` matches only `0.0.0`, so dependents on `^0.0.0` won't get this release; change the range to `^0.0.1` (or `0.0.1`).
+
 ## 0.0.0 (2026-10-09)
 
 First release. A new package, never published under another name.

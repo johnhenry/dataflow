@@ -76,7 +76,33 @@ export interface NodeState<R = unknown> {
    * meaning: `running` until the first settle, then the last settle's status.
    */
   live: boolean;
+  /** Present only on a node set with `queue: true`: how many triggers wait behind the run in flight. */
+  queued?: number;
+  /** Present only on a node set with `queue: true`: triggers dropped because the queue was at `queueLimit` (oldest first). Reset by `reset()`. */
+  dropped?: number;
 }
+
+/**
+ * Why a queued run (a node set with `queue: true`) was started: `ctx.trigger`.
+ * Frozen. `settle`: a triggering dependency settled; `run`: an explicit
+ * `run(id)` / `runAll(...)`; `invalidate`: `invalidate(id)`.
+ */
+export type Trigger<R = unknown> =
+  | {
+      readonly type: "settle";
+      /** The dependency that settled. */
+      readonly id: string;
+      /** Its status then: `"done"`, or `"skipped"` (only seen by a node that consumes the skip). */
+      readonly status: Status;
+      /** Its `version` then. */
+      readonly version: number;
+      /** Its `state.result` then: the same reference, not a copy (the scheduler stores no values). */
+      readonly result: R | undefined;
+      /** Its `state.skip` then, for a skipped settle. */
+      readonly skip?: SkipInfo;
+    }
+  | { readonly type: "run" }
+  | { readonly type: "invalidate" };
 
 /** What a live `resume` run is told when its inputs changed (instead of being restarted). Frozen. */
 export interface ChangeNotice {
@@ -93,10 +119,18 @@ export interface RunContext<R = unknown> {
   runId: number;
   /** Aborts when this run is superseded, the node is deleted, or the graph is reset (live runs too: their iterable's `return()` is called as well). */
   signal: AbortSignal;
-  /** The node's dependency ids at the moment the run started. */
+  /** The node's input ids at the moment the run started: its `deps`, then its sampled inputs. */
   deps: string[];
   /** The inputs that were skipped when the run started. Always empty unless the node declared `consumesSkip`. */
   skipped: string[];
+  /** The sampled inputs (read, not triggering), also listed in `deps`. Empty for a node without `sample`. */
+  sampled: string[];
+  /**
+   * Only for a node set with `queue: true`: the trigger this run is for (which
+   * dependency settled, its version and result reference; or an explicit run).
+   * Absent otherwise.
+   */
+  trigger?: Trigger<R>;
   /**
    * Settle the node now, without ending the run (the push form of a live run;
    * no backpressure). A value settles `done`, `SKIP`/`skip(reason)` settles
@@ -164,8 +198,18 @@ export interface DataflowOptions<R = unknown> {
 }
 
 export interface NodeOptions {
-  /** Ids this node reads from. */
+  /** Ids this node reads from; a settle of any of them triggers it. */
   deps?: string[];
+  /**
+   * Ids this node reads from without being triggered by them (`withLatestFrom`).
+   * They order and gate the node like `deps` (it never starts while one is
+   * queued or running, and waits until each has settled; a failing or waiting
+   * one makes it wait, a skipped one spreads its skip unless consumed), but
+   * their settles never run, stale, invalidate or notify it. `ctx.deps` lists
+   * them after `deps`; `ctx.sampled` names them. An id in both lists triggers.
+   * Default `[]`.
+   */
+  sample?: string[];
   /** Rerun automatically when an input or the definition changes. Default `true`. */
   autorun?: boolean;
   /**
@@ -182,6 +226,16 @@ export interface NodeOptions {
    * `runAll` or `invalidate` of the node. Default `false`.
    */
   resume?: boolean;
+  /**
+   * Queue each trigger (a settle of a dependency in `deps`, or an explicit
+   * `run` / `runAll` / `invalidate`) instead of superseding: runs go one after
+   * another, in order, none aborted by a newer trigger, each with
+   * `ctx.trigger`. `reset()`, `delete(id)` and `run(id, { replace: true })`
+   * clear the queue. Can't be combined with `resume`. Default `false`.
+   */
+  queue?: boolean;
+  /** With `queue`: how many triggers may wait; past it the oldest is dropped (`state.dropped` +1). A positive integer or `Infinity`. Default `1000`. */
+  queueLimit?: number;
 }
 
 export interface RunOptions {
@@ -193,6 +247,15 @@ export interface RunOptions {
    * the node starts, so a node waiting on a broken input keeps it.
    */
   follow?: boolean;
+}
+
+export interface RunNodeOptions extends RunOptions {
+  /**
+   * For a node set with `queue: true`: drop its queued triggers and supersede
+   * the run in flight, as a node without `queue` always does. No effect on
+   * other nodes. Default `false`.
+   */
+  replace?: boolean;
 }
 
 export interface RunAllOptions extends RunOptions {
@@ -212,12 +275,19 @@ export interface Dataflow<R = unknown> {
   consumesSkip(id: string): boolean | string[] | undefined;
   /** The node's `resume` option (named `resumes` because `resume()` un-pauses the graph). */
   resumes(id: string): boolean | undefined;
+  /** The node's sampled inputs (`sample`, without ids that are also in `deps`). */
+  samples(id: string): string[] | undefined;
+  /** The node's `queue` option. */
+  queues(id: string): boolean | undefined;
+  /** The node's `queueLimit` option (the default for a node without `queue`). */
+  queueLimit(id: string): number | undefined;
+  /** The nodes `id` triggers (through their `deps`); nodes that only sample it aren't listed. */
   dependents(id: string): string[];
   /** Topological order (dependencies first); nodes on a cycle are left out. */
   order(ids?: string[]): string[];
   ids(): string[];
-  /** Run now, whatever the autorun flag. `follow: false` holds the dependents (flagged stale, not run). */
-  run(id: string, options?: RunOptions): this;
+  /** Run now, whatever the autorun flag. `follow: false` holds the dependents (flagged stale, not run). A `queue` node queues the run; `replace: true` supersedes instead. */
+  run(id: string, options?: RunNodeOptions): this;
   invalidate(id: string): this;
   /** Queue every node (or `ids`) in dependency order. `follow: false` holds dependents outside the set. */
   runAll(options?: RunAllOptions): this;

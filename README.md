@@ -22,6 +22,7 @@ Zero dependencies. ESM. Runs in browsers, Workers and Node.
 - [Partial runs](#partial-runs)
 - [Equality cut-off](#equality-cut-off)
 - [Live nodes](#live-nodes)
+- [Events: sampled inputs and queued nodes](#events-sampled-inputs-and-queued-nodes)
 - [API](#api)
 - [Honest limitations](#honest-limitations)
 - [Family](#family)
@@ -33,7 +34,7 @@ Zero dependencies. ESM. Runs in browsers, Workers and Node.
 npm install @johnhenry/dataflow
 ```
 
-**Provenance:** a new package, never published under another name. Under npm's caret rules `^0.0.0` matches only `0.0.0` (and `^0.0.1` only `0.0.1`), so pin exactly until a deliberate `0.1.0`; skip values need `0.0.1`, held runs and `UNCHANGED` `0.0.2`, live nodes `0.0.3`.
+**Provenance:** a new package, never published under another name. Under npm's caret rules `^0.0.0` matches only `0.0.0` (and `^0.0.1` only `0.0.1`), so pin exactly until a deliberate `0.1.0`; skip values need `0.0.1`, held runs and `UNCHANGED` `0.0.2`, live nodes `0.0.3`, sampled inputs and queued nodes `0.0.4`.
 
 ## Quick start
 
@@ -84,7 +85,7 @@ Runnable, self-verifying versions are in [`examples/`](examples/).
 | `skipped` | The last run returned `SKIP` / `skip(reason)`, or an input was skipped and the skip spread here (see [Skipping](#skipping)). `state.skip` is `{ source, reason }`. |
 | `error` | The last run threw or rejected (`state.error`), or the node is on a dependency cycle (`state.cycle === true`). |
 
-A node queued behind upstream work keeps its previous state until it actually starts. Every state also carries `version` (settles), `runId` (started runs), `stale` (a manual node whose inputs or definition changed since its last run, or a dependent a [held run](#partial-runs) didn't rerun), `unchanged` (the last run returned [`UNCHANGED`](#equality-cut-off)) and `live` (the run is [live](#live-nodes): it settles more than once).
+A node queued behind upstream work keeps its previous state until it actually starts. Every state also carries `version` (settles), `runId` (started runs), `stale` (a manual node whose inputs or definition changed since its last run, or a dependent a [held run](#partial-runs) didn't rerun), `unchanged` (the last run returned [`UNCHANGED`](#equality-cut-off)) and `live` (the run is [live](#live-nodes): it settles more than once). A node set with [`queue: true`](#queue-true-triggers-queue-instead-of-superseding) also carries `queued` (triggers waiting) and `dropped` (triggers dropped at its limit); no other node has those keys.
 
 ## Guarantees
 
@@ -95,6 +96,8 @@ A node queued behind upstream work keeps its previous state until it actually st
 - **Cycles are refused, not looped.** Every node on a cycle goes to `error` with `cycle: true` as soon as the edge is added, and comes back to `idle` when the cycle is broken.
 - **Held runs stay held.** `run(id, { follow: false })` never starts a dependent that wasn't already asked to run; see [Partial runs](#partial-runs).
 - **Skips spread, they don't stall.** A node that returns `SKIP` is `skipped`, and so is every dependent, without running, until one that declared `consumesSkip` decides what to do. Nothing changes for a graph that never skips.
+- **Sampled inputs order, they don't trigger.** A node never starts while a [sampled](#sample-inputs-that-are-read-but-dont-trigger) input is queued or running, and a sampled input's settle never runs, stales or invalidates it.
+- **Queued nodes are never superseded by a trigger.** A node set with [`queue: true`](#queue-true-triggers-queue-instead-of-superseding) runs once per trigger, in order; only `reset()`, `delete(id)`, `run(id, { replace: true })` or a failing input end a run of it early.
 - **Live sources stay glitch-free and paced.** A [live](#live-nodes) node between settles isn't busy, so a diamond below it sees one consistent version per item; a live iterable is pulled only after everything downstream of its previous item settled.
 
 ## Skipping
@@ -233,6 +236,8 @@ A live iterable is pulled for its next item only once **everything downstream of
 - **Held:** a [held](#partial-runs) live run (`run(id, { follow: false })`) flags its dependents `stale` on every settle instead of running them, so nothing holds it: it is pulled as fast as it yields.
 - **Live itself:** a live dependent between settles isn't busy. One that hasn't settled yet in its current run is `running`, so it holds the producer until its first settle. (A live `resume` dependent that waits for a change before its first settle would therefore wait forever: settle once first.)
 - **A `resume` dependent** counts as settled once it has been told about the change (see below): what it does with the notice is its own business, and its notices coalesce.
+- **A [queue](#queue-true-triggers-queue-instead-of-superseding) dependent** counts as busy while it has triggers waiting, even behind a live run of its own, so a pulled source never overruns its queue.
+- **A node that only [samples](#sample-inputs-that-are-read-but-dont-trigger) the source** doesn't count: the source's items don't trigger it.
 
 The first item is pulled as soon as the iterable is returned (it is the run's own result). While the graph is `pause()`d no item is pulled; emits still settle, as running runs still do. `ctx.emit` has no backpressure: each emit settles at once, and dependents still running on an older emit are superseded (newest wins), so a burst of emits coalesces downstream to the latest.
 
@@ -273,11 +278,62 @@ async *run(id, ctx) {
 
 The scheduler still stores and compares no values: a notice says which inputs changed, not what to; the run reads them wherever they live.
 
+## Events: sampled inputs and queued nodes
+
+Values and events want different rules. A value is "the latest one": when an input changes, the old run is stale, so the newest run wins. An event is "this one happened": a click, a webhook request, a timer tick, a message. Each one should be handled once, in order, and none should be dropped because another came in. A handler usually *reads* some values without being *run* by them, too: "on click, send the draft" shouldn't send on every keystroke. Two node options cover this, and nothing changes for a graph that uses neither.
+
+```js
+flow
+  .set("button") // an event source: each ctx.emit(...) is a click
+  .set("draft")
+  .set("send", { deps: ["button"], sample: ["draft"], queue: true });
+
+async run(id, ctx) {
+  if (id === "send") {
+    const click = ctx.trigger.result; // which click this run is for
+    await post(values.get("draft"), { signal: ctx.signal }); // the draft as it is now
+  }
+}
+```
+
+That is Noodl's Function node with its **Run** input connected, and RxJS's `withLatestFrom` with a queue in front. [`examples/07-events-sample-and-queue.mjs`](examples/07-events-sample-and-queue.mjs) runs it.
+
+### `sample`: inputs that are read but don't trigger
+
+`set(id, { deps, sample: [ids] })`. A sampled input is an input in every respect but one: its settles don't trigger the node.
+
+- **Ordering (glitch-free).** It orders the node like a dependency: the node never starts while a sampled input, or anything upstream of it, is queued or running. In a diamond where a trigger also reruns a sampled input (`a → slow`, `a → n`, `n` samples `slow`), `n` runs once, after `slow`, and sees `slow`'s new value. A cycle through a sampled edge is a cycle.
+- **Readiness.** The node waits until each sampled input has settled at least once. A sampled input that is `waiting` or failing makes the node wait when it is triggered, as a dependency does, and the node runs once that input settles again (it was asked to). A node that was never asked to run isn't run by a sampled input.
+- **No triggering.** A new settle of a sampled input (a value, a skip, `UNCHANGED`, an error, a live item) doesn't run the node, doesn't flag it `stale`, doesn't make it wait, doesn't notify a [`resume`](#resume-instead-of-restart) run, and doesn't add a trigger to its queue. A live sampled source isn't held back by the nodes that sample it.
+- **The run sees all inputs.** `ctx.deps` lists the `deps`, then the sampled ids; `ctx.sampled` names the sampled ones (it is `[]` for other nodes). `deps(id)` returns only `deps`, `samples(id)` the sampled ids, and `dependents(id)` only the nodes `id` triggers. An id in both lists triggers.
+- **Skips.** A skipped sampled input spreads its skip when the node is *triggered* (not when the input settles), unless the node consumes it: `consumesSkip: true`, or a list that names it. A consumer sees it in `ctx.skipped`.
+
+### `queue: true`: triggers queue instead of superseding
+
+`set(id, { deps, queue: true, queueLimit })`. A trigger is a settle of a dependency in `deps` that would run the node, or an explicit `run(id)`, `runAll(...)` or `invalidate(id)`.
+
+- **One run per trigger, in order, none aborted by a newer trigger.** A trigger that arrives while a run is in flight waits in the node's queue; when the run settles, the next trigger starts a run. `state.queued` counts the triggers waiting.
+- **`ctx.trigger`** tells each run what it is for: `{ type: "settle", id, status, version, result, skip? }` for a dependency's settle (`result` is the same reference as that settle's `state.result`: the scheduler copies nothing), or `{ type: "run" }` / `{ type: "invalidate" }`. It is frozen. Other nodes don't get it.
+- **A bound.** `queueLimit` (default `1000`, a positive integer or `Infinity`) caps the waiting triggers; past it the **oldest** is dropped and counted in `state.dropped`.
+- **Clearing.** `reset()` and `delete(id)` clear the queue. `run(id, { replace: true })` drops what is queued and supersedes the run in flight, as a node without `queue` always does (for other nodes `replace` changes nothing).
+- **A live source feeding a queue node delivers every value, in order.** Pulled from an iterable, each item waits for the queue to drain ([backpressure](#backpressure) counts a queue node with triggers left as busy). Pushed with `ctx.emit`, a burst lands in the queue and is handled one by one, where a superseding node would see only the last value.
+- **Held runs.** Each trigger keeps its own `follow`: `run(id, { follow: false })` queues a held run, and the next trigger follows. A held run upstream doesn't add a trigger (a done queue node is flagged `stale`, as any dependent).
+- **Failures and skips.** A failing input makes the node wait, as for any node: the run in flight is aborted and its trigger goes back to the head of the queue, so it runs again once the input recovers and no trigger is lost (the run may have done part of its work already, as an interrupted run always may). Each trigger is judged by its own settle: a trigger for a skip is answered with a skip (the node settles `skipped` without running, unless it consumes the skip), and a value queued before a skip still runs; the node's other inputs are judged as they are when the trigger's turn comes. A skip settle doesn't abort the run in flight: it is a trigger like any other.
+- **Dependents stay glitch-free.** A queue node with triggers left is still queued, so its dependents run once its queue has drained (a superseding dependent sees the last settle; a queue dependent gets one trigger per settle, with its `version` and `result`). In a diamond, a queue node runs once per triggering settle, so once for each branch.
+- **Its own live run holds the queue.** If a queued run is [live](#live-nodes), the next trigger waits until it ends (`ctx.close()`, its iterable finishing, its promise resolving).
+- **Not with `resume`.** `set(id, { queue: true, resume: true })` throws a `TypeError`: a live `resume` run is told about changes instead of being rerun, and its notices coalesce, latest wins, so there would be nothing to queue. A `resume` node upstream of a queue node is fine: each of its settles is a trigger.
+- **`runAll` queues too.** `runAll()` asks every node to run, so a queue node gets a `{ type: "run" }` trigger as well as one per settle of its inputs; use `run(sourceId)` or `runAll({ ids })` to start only the sources.
+- **An event source that hasn't fired yet is `running`.** A run that will `emit` later is `running` until its first emit, so its dependents, and `idle()`, wait for it. Emit `SKIP` first to say "no event yet": the dependents are `skipped` (a queue node's trigger is answered by the skip) until the first real event.
+
+**Why node options.** Like `autorun`, `consumesSkip` and `resume`, these are properties of the node that the scheduler needs before a settle arrives: whether a settle triggers the node, and whether a trigger supersedes or queues. Read them back with `samples(id)`, `queues(id)` and `queueLimit(id)`; `set` changes them (switching `queue` off turns what was queued into one ordinary run).
+
+The scheduler still stores and compares no values: a trigger carries the dependency's result *reference*, which the scheduler already holds in `state.result`.
+
 ## API
 
 ### `createDataflow({ run, onChange?, schedule? })`
 
-- `run(id, { runId, signal, deps, skipped, emit, close, changes, onChange })` -- compute one node; may return a value or a promise. `deps` is the dependency list at the moment the run started; `skipped` lists the inputs that were skipped (only ever non-empty for a node with `consumesSkip`). Return `SKIP` or `skip(reason)` to skip the node, and `UNCHANGED` or `unchanged(result)` when the value equals the previous one. Return `live(iterable)` (or make `run` an `async function*`), or call `emit(result)`, for a [live run](#live-nodes); `close()` ends it; `changes` / `onChange(fn)` deliver change notices to a live `resume` node.
+- `run(id, { runId, signal, deps, skipped, sampled, trigger, emit, close, changes, onChange })` -- compute one node; may return a value or a promise. `deps` is the input list at the moment the run started (`deps`, then sampled inputs); `skipped` lists the inputs that were skipped (only ever non-empty for a node with `consumesSkip`); `sampled` lists the [sampled](#sample-inputs-that-are-read-but-dont-trigger) inputs; `trigger` (only for a [`queue`](#queue-true-triggers-queue-instead-of-superseding) node) says what this run is for. Return `SKIP` or `skip(reason)` to skip the node, and `UNCHANGED` or `unchanged(result)` when the value equals the previous one. Return `live(iterable)` (or make `run` an `async function*`), or call `emit(result)`, for a [live run](#live-nodes); `close()` ends it; `changes` / `onChange(fn)` deliver change notices to a live `resume` node.
 - `onChange(id, state)` -- called on every state change (also see `subscribe`).
 - `schedule(fn)` -- how flushes are deferred; default `queueMicrotask`.
 
@@ -285,17 +341,17 @@ Returns a graph object; mutating methods return it, so calls chain.
 
 | Method | Does |
 | --- | --- |
-| `set(id, { deps = [], autorun = true, consumesSkip = false, resume = false })` | Add a node, or replace its dependencies / autorun flag / skip handling (`true`, or the input ids it consumes skips from) / [resume](#resume-instead-of-restart) flag. Never runs anything by itself. |
+| `set(id, { deps = [], sample = [], autorun = true, consumesSkip = false, resume = false, queue = false, queueLimit = 1000 })` | Add a node, or replace its dependencies / [sampled inputs](#sample-inputs-that-are-read-but-dont-trigger) / autorun flag / skip handling (`true`, or the input ids it consumes skips from) / [resume](#resume-instead-of-restart) flag / [queue](#queue-true-triggers-queue-instead-of-superseding) options. Never runs anything by itself. |
 | `delete(id)` | Remove a node; its dependents start waiting. |
-| `run(id, { follow = true })` | Run now, whatever the autorun flag. Autorun dependents follow; `follow: false` holds them (flagged `stale`, not run). |
+| `run(id, { follow = true, replace = false })` | Run now, whatever the autorun flag. Autorun dependents follow; `follow: false` holds them (flagged `stale`, not run). A `queue` node queues the run; `replace: true` clears its queue and supersedes its run in flight. |
 | `invalidate(id)` | The definition changed: autorun nodes rerun, manual nodes become `stale`. |
 | `runAll({ all = true, ids, follow = true })` | Queue nodes in dependency order; `all: false` skips manual nodes; `follow: false` holds dependents outside the set. |
-| `reset()` | Forget every result, abort in-flight runs and close live ones (for example after the place your values live was restarted). |
+| `reset()` | Forget every result, abort in-flight runs, close live ones and clear every queue (for example after the place your values live was restarted). |
 | `pause()` / `resume()` / `paused` | Hold new runs and live pulls; running ones still settle (and emit). |
-| `get(id)`, `has(id)`, `deps(id)`, `autorun(id)`, `consumesSkip(id)`, `resumes(id)`, `dependents(id)`, `ids()` | Read the graph. `resumes(id)` is the `resume` option. |
+| `get(id)`, `has(id)`, `deps(id)`, `samples(id)`, `autorun(id)`, `consumesSkip(id)`, `resumes(id)`, `queues(id)`, `queueLimit(id)`, `dependents(id)`, `ids()` | Read the graph. `resumes(id)` is the `resume` option, `queues(id)` the `queue` option; `dependents(id)` lists the nodes `id` triggers, not the ones that only sample it. |
 | `order(ids?)` | Topological order, dependencies first; nodes on a cycle are omitted. |
 | `subscribe(fn)` | Listen to every change; returns an unsubscribe function. A listener that throws is reported (`reportError`) and affects neither other listeners nor scheduling, like an `EventTarget` listener. |
-| `idle()` | Resolves once nothing is queued or running (or the graph is paused). A live node between settles isn't running, so `idle()` doesn't wait for an open stream; one that hasn't settled yet in its run is, and it does. |
+| `idle()` | Resolves once nothing is queued or running (or the graph is paused). A live node between settles isn't running, so `idle()` doesn't wait for an open stream; one that hasn't settled yet in its run is, and it does. Triggers held behind a queue node's open live run don't hold it either. |
 
 ### `SKIP`, `skip(reason?)`, `isSkip(value)`
 
@@ -325,6 +381,8 @@ TypeScript declarations ship in `src/index.d.ts`.
 - **No first-to-finish race.** Glitch-freedom means a node with skip-consuming inputs runs once all of them settled, never on the first one; see [Skipping](#skipping).
 - **Live producers must cooperate.** A producer that yields forever without ever awaiting anything that takes a turn of the event loop (a timer, I/O) starves it, as any endless async loop does; and `return()` reaches an async generator only at a `yield`, so a long await should follow `ctx.signal` for cleanup to be prompt. A shared source that two runs read in turn (a queue) can hand an item to a run that is about to be superseded; the scheduler drops that run's late items, it can't give them to the next run.
 - **Generator functions are recognized only natively.** A `run` that is itself an `async function*` (a method or a bound one too) is live without the marker; the scheduler tells it from an ordinary function by its built-in type tag. A function that returns a generator, a wrapper around one, or a generator transpiled to plain functions can't be told apart, so it returns `live(iterable)` like any other `run`.
+- **Events are opt-in, per node.** Every node supersedes unless set with `queue: true`, and every input triggers unless listed in `sample`. A queue holds triggers, not values: a queued run reads its inputs as they are when it starts, so a run that needs the value *of its event* uses `ctx.trigger.result` (a reference to that settle's `state.result`), or a payload the event carried.
+- **Queues are per node and bounded.** A queue node runs once per triggering settle, including one per branch in a diamond; past `queueLimit` the oldest triggers are dropped (counted, not kept). A run interrupted by a failing input runs again for the same trigger, so a handler with side effects should tolerate a retry. `queue` and `resume` can't be combined.
 - **Scans are linear.** Finding dependents walks every node; that is fine for hundreds or a few thousand nodes (a notebook, a spreadsheet tab), not for a million-cell sheet.
 - **One process.** The graph is in-memory and not shared across tabs or machines.
 

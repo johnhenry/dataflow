@@ -10,6 +10,7 @@ Runnable, self-verifying examples. Each one asserts the behavior it demonstrates
 | [`04-skip-values.mjs`](./04-skip-values.mjs) | Two mutually exclusive branches return `SKIP` / `skip(reason)`; the skip spreads to a dependent without running it, a `consumesSkip` coalesce takes whichever branch produced a value, and the skipped chain recovers when its branch applies again. |
 | [`05-partial-runs-and-unchanged.mjs`](./05-partial-runs-and-unchanged.mjs) | `run(id, { follow: false })` runs one cell and flags the expensive cell below it `stale` instead of rerunning it; a `run` that returns `UNCHANGED` for an equal value stops propagation. |
 | [`06-live-nodes.mjs`](./06-live-nodes.mjs) | A live source (an async generator over a stand-in socket, returned as `live(...)`) settles once per reading, and a burst is shown one reading at a time (backpressure); changing its input restarts it and the old generator's `finally` runs; a `resume: true` history keeps its live run across changes and accumulates every reading through `ctx.changes`. |
+| [`07-events-sample-and-queue.mjs`](./07-events-sample-and-queue.mjs) | A send node that samples the draft (`sample`) isn't run by typing; with `queue: true`, a burst of clicks during a slow send is sent once each, in order, none aborted, each run knowing its click from `ctx.trigger`, while a superseding node behind the same button finishes only for the last click; a `queueLimit: 2` queue drops its oldest triggers and counts them in `state.dropped`. |
 
 ## Running
 

@@ -2,19 +2,19 @@
 
 ## 0.0.3 (2026-10-10)
 
-Live nodes: runs that settle more than once, with an opt-in resume (#6, #7; designed in johnhenry/miso#94). Additive: a graph whose runs never return an async iterable or call `ctx.emit` produces the same `onChange` sequence as 0.0.2 (every state now also carries `live: false`).
+Live nodes: runs that settle more than once, with an opt-in resume (#6, #7; designed in johnhenry/miso#94). Additive and opt-in: a graph whose runs never return `live(...)`, aren't an `async function*`, and never call `ctx.emit` produces the same `onChange` sequence as 0.0.2 (every state now also carries `live: false`); an async iterable returned as a plain value (a `ReadableStream`, a generator object) is still a plain value.
 
-- **A `run` that returns an async iterable is live.** Each item settles the node (`version` +1, `state.result`, dependents run); `SKIP` / `skip(reason)` items settle `skipped`, `UNCHANGED` / `unchanged(result)` items work as when returned, a thrown error settles `error` and ends the run. `run` can be an `async function*` itself.
+- **`live(iterable)`, `isLive(value)`, `LIVE`: a `run` that returns `live(iterable)` is live**, and so is every run of a `run` that is itself an `async function*` (recognized by its built-in type tag; a function that merely returns a generator needs the marker). Each item settles the node (`version` +1, `state.result`, dependents run); `SKIP` / `skip(reason)` items settle `skipped`, `UNCHANGED` / `unchanged(result)` items work as when returned, a thrown error settles `error` and ends the run.
 - **`ctx.emit(result)`** settles the node from inside a run (push form, no backpressure) and returns `false` once the run is superseded, reset, deleted, closed or ended. The run stays live until its promise resolves (its resolved value then doesn't settle again) or **`ctx.close()`**.
 - **`state.live`** (new, `false` by default) is `true` while a run is live, in `get` and `onChange`. Statuses keep their meanings.
 - **Backpressure.** An iterable's next item is pulled only once nothing downstream of it (transitively) is queued or running: the `upstreamBusy` rule applied downstream. Manual, held (`stale`), waiting and errored dependents don't hold it; a held live run is pulled freely; a `pause()`d graph pulls nothing.
 - **Glitch-free.** A live node between settles isn't busy; a diamond below a live source runs its join once per item, on one consistent version.
-- **Ending a live run.** Supersession (a newer run, or an input change), `reset()`, `delete(id)`, a failing input and a spreading skip abort the run's signal **and** call the iterable's `return()`, so a generator's `finally` runs; late items and emits are dropped. An iterable returned by an already-superseded run is closed unread.
+- **Ending a live run.** Supersession (a newer run, or an input change), `reset()`, `delete(id)`, a failing input and a spreading skip abort the run's signal **and** call the iterable's `return()`, so a generator's `finally` runs; late items and emits are dropped. A `live(...)` iterable returned by an already-superseded run is closed unread; a plain one is dropped untouched, as before.
 - **Resume: `set(id, { resume: true })`** keeps a live run when its inputs change and tells it through **`ctx.changes`** (an async iterable of `{ deps, skipped, changed }` notices, coalesced latest-wins, buffered from the start of the run) and **`ctx.onChange(fn)`** (the callback form). Notices are glitch-free, like runs. A run that isn't live yet, an explicit `run` / `runAll`, and `invalidate` still restart it. New reader `resumes(id)` (`resume()` already un-pauses the graph).
 - **Held runs:** a held live run's settles flag dependents `stale` instead of running them.
-- Types: `NodeState.live`, `NodeOptions.resume`, `RunContext<R>` with `emit` / `close` / `changes` / `onChange`, `ChangeNotice`, `RunResult<R>` (admits `AsyncIterable`), `Dataflow.resumes`.
-- New example `examples/06-live-nodes.mjs`; README section "Live nodes"; Honest limitations updated (producers must cooperate; async iterables are always live).
-- **Upgrading:** a `run` that returned an async iterable (an async generator, a `ReadableStream`) as a plain value now makes its node live; wrap it (`return { stream }`) to keep it a value. Under npm's caret rules `^0.0.2` matches only `0.0.2`; change the range to `^0.0.3` (or `0.0.3`).
+- Types: `NodeState.live`, `NodeOptions.resume`, `RunContext<R>` with `emit` / `close` / `changes` / `onChange`, `ChangeNotice`, `Live<T>`, `live`, `isLive`, `LIVE`, `RunResult<R>` (admits `Live`, and `AsyncIterable` for an `async function*` run), `Dataflow.resumes`.
+- New example `examples/06-live-nodes.mjs`; README section "Live nodes"; Honest limitations updated (producers must cooperate; generator functions are recognized only natively).
+- **Upgrading:** under npm's caret rules `^0.0.2` matches only `0.0.2`; change the range to `^0.0.3` (or `0.0.3`).
 
 ## 0.0.2 (2026-10-10)
 

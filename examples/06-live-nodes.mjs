@@ -1,16 +1,18 @@
 // Live nodes: a run that settles more than once.
 //
-// 1. A live source. `run` returns an async iterable (here an async generator
+// 1. A live source. `run` returns `live(iterable)` (here an async generator
 //    reading a stand-in for a socket or a sensor). Each item settles the node
 //    and its dependents run; the next item is pulled only once they settled,
-//    so a burst of readings is shown one by one, never superseded.
+//    so a burst of readings is shown one by one, never superseded. Live runs
+//    are opt-in: `run` wraps the generator in `live(...)` (any other async
+//    iterable it returned would be a plain value).
 // 2. Restart and cleanup. Changing the unit restarts the live run: its signal
 //    aborts, the generator's `finally` runs, and a new run starts.
 // 3. Resume. A node set with `resume: true` keeps its live run when its input
 //    changes and is told through `ctx.changes`: here, a history that
 //    accumulates every reading shown, which a restart would have lost.
 import assert from "node:assert/strict";
-import { createDataflow } from "@johnhenry/dataflow";
+import { createDataflow, live } from "@johnhenry/dataflow";
 
 // A stand-in for a socket: readings arrive when `arrive` is called.
 const queue = [];
@@ -54,7 +56,7 @@ async function* storing(id, items, signal) {
 const flow = createDataflow({
   async run(id, ctx) {
     const out = await formulas[id](...ctx.deps.map((d) => values.get(d)), ctx);
-    if (out?.[Symbol.asyncIterator]) return storing(id, out, ctx.signal);
+    if (Object.prototype.toString.call(formulas[id]) === "[object AsyncGeneratorFunction]") return live(storing(id, out, ctx.signal));
     if (!ctx.signal.aborted) values.set(id, out);
     if (id === "shown") log.push(`shown ${out}`);
     return out;

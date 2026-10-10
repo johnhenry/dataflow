@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createDataflow, SKIP, skip, UNCHANGED } from "../src/index.mjs";
+import { createDataflow, SKIP, skip, UNCHANGED, live, isLive, LIVE } from "../src/index.mjs";
 
 // No wall-clock sleeps: a "tick" is one turn of the event loop, and producers
 // are driven by hand through deferreds.
@@ -55,6 +55,8 @@ function source(signal) {
   };
 }
 
+const isAsyncGeneratorFunction = (fn) => Object.prototype.toString.call(fn) === "[object AsyncGeneratorFunction]";
+
 /** Values live outside the scheduler; `defs` maps id -> (inputs..., ctx) => value | async iterable. */
 function sheet() {
   const values = new Map();
@@ -64,7 +66,10 @@ function sheet() {
   const flow = createDataflow({
     run(id, ctx) {
       runs.push(id);
-      return defs.get(id)(...ctx.deps.map((d) => values.get(d)), ctx);
+      const fn = defs.get(id);
+      const out = fn(...ctx.deps.map((d) => values.get(d)), ctx);
+      // The caller opts in, as a notebook would for a cell written as a generator.
+      return isAsyncGeneratorFunction(fn) ? live(out) : out;
     },
     onChange: (id, s) => states.push([id, s]),
   });
@@ -82,10 +87,98 @@ function sheet() {
   return { flow, values, defs, runs, states, define, store };
 }
 
-test("a run that returns an async iterable settles once per item: version +1, live while open", async () => {
+test("live(iterable), LIVE and isLive", () => {
+  assert.equal(LIVE, Symbol.for("@johnhenry/dataflow.live"));
+  const gen = (async function* () {})();
+  const marked = live(gen);
+  assert.ok(isLive(marked));
+  assert.equal(marked.iterable, gen);
+  assert.ok(Object.isFrozen(marked));
+  assert.ok(!isLive(gen));
+  assert.ok(!isLive(undefined));
+  assert.throws(() => live([1, 2]), TypeError, "a sync iterable isn't accepted");
+  assert.throws(() => live(undefined), TypeError);
+});
+
+test("opt-in: an async iterable returned without live() is a plain value, exactly as in 0.0.2", async () => {
+  const stream = new ReadableStream({ start: (c) => c.enqueue("chunk") });
+  let pulled = false;
+  const gen = (async function* () {
+    pulled = true;
+    yield 1;
+  })();
+  const seen = [];
+  const results = { stream, gen };
+  const flow = createDataflow({
+    run: (id) => results[id] ?? id,
+    onChange: (id, s) => seen.push(`${id}:${s.status}:${s.version}:${s.live}`),
+  });
+  flow.set("stream").set("gen").set("dep", { deps: ["stream", "gen"] });
+  flow.runAll();
+  await flow.idle();
+  assert.equal(flow.get("stream").result, stream, "the stream itself is the result");
+  assert.equal(flow.get("gen").result, gen);
+  assert.equal(stream.locked, false, "the scheduler never read or cancelled the stream");
+  assert.equal(pulled, false, "the generator was never pulled");
+  assert.deepEqual(seen, [
+    "stream:idle:0:false",
+    "gen:idle:0:false",
+    "dep:idle:0:false",
+    "stream:running:0:false",
+    "gen:running:0:false",
+    "stream:done:1:false",
+    "gen:done:1:false",
+    "dep:running:0:false",
+    "dep:done:1:false",
+  ]);
+  // A superseded run's iterable is dropped untouched, as before.
+  const late = new ReadableStream();
+  const gate = deferred();
+  let call = 0;
+  const flow2 = createDataflow({ run: async () => (++call === 1 ? (await gate.promise, late) : "second") });
+  flow2.set("x");
+  flow2.run("x");
+  await tick();
+  flow2.run("x");
+  await flow2.idle();
+  gate.resolve();
+  await ticks(3);
+  assert.equal(flow2.get("x").result, "second");
+  assert.equal(late.locked, false);
+});
+
+test("a run that is itself an async function* is live without the marker; a function returning a generator is not", async () => {
+  const flow = createDataflow({
+    async *run(id) {
+      yield `${id} 1`;
+      yield `${id} 2`;
+    },
+  });
+  flow.set("a");
+  flow.run("a");
+  await flow.idle();
+  assert.equal(flow.get("a").version, 2);
+  assert.equal(flow.get("a").result, "a 2");
+  const gen = async function* (id) {
+    yield id;
+  };
+  const wrapped = createDataflow({ run: (id) => gen(id) });
+  wrapped.set("b");
+  wrapped.run("b");
+  await wrapped.idle();
+  assert.equal(wrapped.get("b").version, 1);
+  assert.equal(typeof wrapped.get("b").result[Symbol.asyncIterator], "function", "a value, not a live run");
+  const bound = createDataflow({ run: gen.bind(null) });
+  bound.set("c");
+  bound.run("c");
+  await bound.idle();
+  assert.equal(bound.get("c").result, "c", "a bound async function* is still one");
+});
+
+test("a run that returns live(iterable) settles once per item: version +1, live while open", async () => {
   const { flow, define, states } = sheet();
   const src = source();
-  define("live", [], () => src.iterable);
+  define("live", [], () => live(src.iterable));
   flow.run("live");
   await ticks(2); // running, nothing yielded yet: idle() would wait for it
   assert.deepEqual(flow.get("live"), { status: "running", version: 0, runId: 1, stale: false, unchanged: false, cycle: false, live: true });
@@ -128,7 +221,7 @@ test("an iterable that finishes ends the live run: live false, status and result
 test("live items: UNCHANGED keeps version and dependents; SKIP settles skipped and spreads; a later item recovers", async () => {
   const { flow, define, store, values, runs } = sheet();
   const src = source();
-  define("live", [], () => src.iterable);
+  define("live", [], () => live(src.iterable));
   define("dep", ["live"], store("dep", (v) => `seen ${v}`));
   flow.run("live");
   src.push(1);
@@ -381,7 +474,7 @@ for (const [how, stopIt] of [
       producers.push(src);
       signals.push(ctx.signal);
       emits.push(ctx.emit);
-      return src.iterable;
+      return live(src.iterable);
     });
     flow.runAll();
     await ticks(2);
@@ -464,14 +557,14 @@ test("an iterable returned by a run that was superseded before it resolved is cl
     const n = ++call;
     if (n === 1) await gate.promise;
     let sent = false;
-    return {
+    return live({
       [Symbol.asyncIterator]() {
         return {
           next: () => (sent ? new Promise(() => {}) : ((sent = true), Promise.resolve({ value: `item ${n}`, done: false }))),
           return: () => (closed.push(n), Promise.resolve({ done: true })),
         };
       },
-    };
+    });
   });
   flow.run("live");
   await tick();
@@ -545,7 +638,7 @@ test("ctx.close() ends the live run: later emits are refused, an open iterable i
   const slow = deferred();
   define("iter", [], (ctx) => {
     ctxRef = ctx;
-    return src.iterable;
+    return live(src.iterable);
   });
   define("dep", ["iter"], () => slow.promise); // holds the producer at its yield
   flow.run("iter");
@@ -568,10 +661,12 @@ test("a run can emit and then return an async iterable: both settle, in order", 
   flow.subscribe((id, s) => id === "both" && s.version !== version && (version = s.version) && results.push(s.result));
   define("both", [], (ctx) => {
     ctx.emit("cached");
-    return (async function* () {
-      yield "fresh 1";
-      yield "fresh 2";
-    })();
+    return live(
+      (async function* () {
+        yield "fresh 1";
+        yield "fresh 2";
+      })(),
+    );
   });
   flow.run("both");
   await flow.idle();

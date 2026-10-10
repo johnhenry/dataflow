@@ -95,7 +95,7 @@ A node queued behind upstream work keeps its previous state until it actually st
 - **Cycles are refused, not looped.** Every node on a cycle goes to `error` with `cycle: true` as soon as the edge is added, and comes back to `idle` when the cycle is broken.
 - **Held runs stay held.** `run(id, { follow: false })` never starts a dependent that wasn't already asked to run; see [Partial runs](#partial-runs).
 - **Skips spread, they don't stall.** A node that returns `SKIP` is `skipped`, and so is every dependent, without running, until one that declared `consumesSkip` decides what to do. Nothing changes for a graph that never skips.
-- **Live sources stay glitch-free and paced.** A [live](#live-nodes) node between settles isn't busy, so a diamond below it sees one consistent version per item; an async iterable is pulled only after everything downstream of its previous item settled.
+- **Live sources stay glitch-free and paced.** A [live](#live-nodes) node between settles isn't busy, so a diamond below it sees one consistent version per item; a live iterable is pulled only after everything downstream of its previous item settled.
 
 ## Skipping
 
@@ -191,12 +191,13 @@ const flow = createDataflow({
 
 ## Live nodes
 
-Some values change by themselves: a clock, a socket, a sensor, a file watch, a model streaming tokens. Rerunning the producer for each new value is wrong (it would reconnect every time); a **live run** settles more than once instead. Each settle is a new value of the node: `version` +1, `state.result` updated, dependents run as for any settle. Nothing changes for a graph that doesn't use it.
+Some values change by themselves: a clock, a socket, a sensor, a file watch, a model streaming tokens. Rerunning the producer for each new value is wrong (it would reconnect every time); a **live run** settles more than once instead. Each settle is a new value of the node: `version` +1, `state.result` updated, dependents run as for any settle. Live runs are **opt-in**: nothing changes for a graph that doesn't ask for one, and an async iterable returned as a plain value (a `ReadableStream`, a generator object) stays a plain value.
 
 ```js
 const flow = createDataflow({
   async *run(id, ctx) {
-    // `run` may be an async generator itself, or return any async iterable.
+    // `run` is an async generator function itself, so every run is live.
+    // Any other `run` opts in per run: `return live(iterable)`.
     const socket = connect(feeds[id], { signal: ctx.signal }); // stops iterating when the signal aborts
     try {
       for await (const message of socket) yield message; // each item settles the node
@@ -209,8 +210,8 @@ const flow = createDataflow({
 
 A run goes live in either of two ways, or both:
 
-- **Return an async iterable** (pull form). Each item settles the node: a value settles `done`, `SKIP` / `skip(reason)` settles `skipped` (and spreads), `UNCHANGED` / `unchanged(result)` works as it does when returned. A thrown error settles `error` and ends the run. When the iterable finishes the run ends; one that finishes without an item settles `done` with `result: undefined`, like a function that returns nothing. Its `{ done: true }` value is ignored, as `for await` ignores it.
-- **Call `ctx.emit(result)`** (push form, for callback sources). It settles the node right away, exactly like an item, and returns `true`; it returns `false` and does nothing once the run was superseded, reset, deleted, closed or ended. The run stays live until its promise resolves, `ctx.close()` is called, or it errors. Once a run has emitted, its resolved value no longer settles anything: resolving just ends it (emit the last value before returning). A run may emit and then return an async iterable, which takes over.
+- **Return `live(iterable)`** (pull form), or make `run` itself an `async function*`. Each item settles the node: a value settles `done`, `SKIP` / `skip(reason)` settles `skipped` (and spreads), `UNCHANGED` / `unchanged(result)` works as it does when returned. A thrown error settles `error` and ends the run. When the iterable finishes the run ends; one that finishes without an item settles `done` with `result: undefined`, like a function that returns nothing. Its `{ done: true }` value is ignored, as `for await` ignores it.
+- **Call `ctx.emit(result)`** (push form, for callback sources). It settles the node right away, exactly like an item, and returns `true`; it returns `false` and does nothing once the run was superseded, reset, deleted, closed or ended. The run stays live until its promise resolves, `ctx.close()` is called, or it errors. Once a run has emitted, its resolved value no longer settles anything: resolving just ends it (emit the last value before returning). A run may emit and then return `live(iterable)`, which takes over.
 
 ```js
 async run(id, { emit, signal }) {
@@ -225,7 +226,7 @@ async run(id, { emit, signal }) {
 
 ### Backpressure
 
-An async iterable is pulled for its next item only once **everything downstream of its previous item has settled**: no node downstream of it (transitively, not just its direct dependents) is queued to run or `running`. It is the glitch-freedom rule (`upstreamBusy`) applied downstream, and it means a burst from a fast producer reaches the graph one item at a time, each one through the whole graph, with no run superseded and nothing buffered in the scheduler (the producer waits at its `yield`). Precisely, a downstream node counts as settled when it is:
+A live iterable is pulled for its next item only once **everything downstream of its previous item has settled**: no node downstream of it (transitively, not just its direct dependents) is queued to run or `running`. It is the glitch-freedom rule (`upstreamBusy`) applied downstream, and it means a burst from a fast producer reaches the graph one item at a time, each one through the whole graph, with no run superseded and nothing buffered in the scheduler (the producer waits at its `yield`). Precisely, a downstream node counts as settled when it is:
 
 - `done`, `skipped`, `error`, `waiting` or `idle` and not queued. A `waiting` dependent (an input failed) and an errored one don't hold the producer.
 - **Manual** (`autorun: false`): it is flagged `stale`, not queued, so it never holds the producer.
@@ -241,7 +242,7 @@ A live node between settles isn't busy, so it doesn't block its dependents; each
 
 ### Ending a live run: supersede, reset, delete
 
-A newer run of the node (an explicit `run`, or an input change, which restarts it by default), `reset()`, `delete(id)`, an input that fails (the node waits) or a skip spreading onto it all end the live run: its `AbortSignal` aborts **and** its iterable's `return()` is called, so an async generator's `finally` runs. Items and emits that arrive later are dropped (`emit` returns `false`). An iterable returned by a run that was already superseded is closed unread.
+A newer run of the node (an explicit `run`, or an input change, which restarts it by default), `reset()`, `delete(id)`, an input that fails (the node waits) or a skip spreading onto it all end the live run: its `AbortSignal` aborts **and** its iterable's `return()` is called, so an async generator's `finally` runs. Items and emits that arrive later are dropped (`emit` returns `false`). A `live(...)` iterable returned by a run that was already superseded is closed unread (a plain value is dropped untouched, as always).
 
 `return()` reaches a generator only at a `yield`. One that is held by backpressure is at a `yield`, so its `finally` runs at once; one that is awaiting something (the next socket message) runs it when that await ends, so make long waits follow `ctx.signal` (as `readings()` does in [`examples/06-live-nodes.mjs`](examples/06-live-nodes.mjs), or with `abortable()` from `@johnhenry/iteration`). `ctx.close()` ends the run from inside: later emits are refused and an open iterable is closed, but the signal doesn't abort (it is an end, not a cancellation). Errors thrown by a producer's cleanup are dropped, like the rejection of any superseded run.
 
@@ -266,7 +267,7 @@ async *run(id, ctx) {
 - **`ctx.changes`** is an async iterable of change notices `{ deps, skipped, changed }`: the node's dependencies now, the skipped inputs (for a `consumesSkip` node), and the inputs that settled since the last notice. It is a mailbox of one, **coalesced, latest wins**: notices that arrive before the run takes the previous one merge into one (latest `deps` and `skipped`, `changed` merged), and they are kept from the moment the run starts, so a generator that starts listening after its first `yield` misses nothing. It is meant for one consumer, and it ends when the run ends (a `for await` over it then simply finishes). For a node without `resume` it never yields.
 - **`ctx.onChange(fn)`** is the callback form: `fn(notice)` for every notice (not coalesced), returning an unsubscribe function; a throwing callback is reported like a throwing listener. It suits the `emit` form: `ctx.onChange(() => emit(recompute()))`.
 - Notices follow the same rules as runs: one per upstream wave, only once nothing upstream is busy (glitch-free), after the change actually reaches the node (a manual node is flagged `stale`, a held one too; an `UNCHANGED` input doesn't notify).
-- **What still restarts it:** a run that isn't live yet (it hasn't emitted or returned an iterable), an explicit `run(id)` / `runAll(...)`, and `invalidate(id)` (a new definition). **What ends it:** an input that fails (the node waits) or a skip spreading onto it, as for any node.
+- **What still restarts it:** a run that isn't live yet (it hasn't emitted or returned a live iterable), an explicit `run(id)` / `runAll(...)`, and `invalidate(id)` (a new definition). **What ends it:** an input that fails (the node waits) or a skip spreading onto it, as for any node.
 
 **Why a node option.** Restart or resume is a property of the node (the caller knows, per cell, whether its code is written to resume), and the scheduler has to know it before the change arrives, to decide between superseding the run and notifying it; a flag the handler sets would make that decision depend on how far the run had got. As an option it sits with `autorun` and `consumesSkip`, can be read back (`resumes(id)`; `resume()` already un-pauses the graph), and changes with `set` like them. `ctx.changes` and `ctx.onChange` are on every run, so the handler needs no flag of its own.
 
@@ -276,7 +277,7 @@ The scheduler still stores and compares no values: a notice says which inputs ch
 
 ### `createDataflow({ run, onChange?, schedule? })`
 
-- `run(id, { runId, signal, deps, skipped, emit, close, changes, onChange })` -- compute one node; may return a value or a promise. `deps` is the dependency list at the moment the run started; `skipped` lists the inputs that were skipped (only ever non-empty for a node with `consumesSkip`). Return `SKIP` or `skip(reason)` to skip the node, and `UNCHANGED` or `unchanged(result)` when the value equals the previous one. Return an async iterable, or call `emit(result)`, for a [live run](#live-nodes); `close()` ends it; `changes` / `onChange(fn)` deliver change notices to a live `resume` node.
+- `run(id, { runId, signal, deps, skipped, emit, close, changes, onChange })` -- compute one node; may return a value or a promise. `deps` is the dependency list at the moment the run started; `skipped` lists the inputs that were skipped (only ever non-empty for a node with `consumesSkip`). Return `SKIP` or `skip(reason)` to skip the node, and `UNCHANGED` or `unchanged(result)` when the value equals the previous one. Return `live(iterable)` (or make `run` an `async function*`), or call `emit(result)`, for a [live run](#live-nodes); `close()` ends it; `changes` / `onChange(fn)` deliver change notices to a live `resume` node.
 - `onChange(id, state)` -- called on every state change (also see `subscribe`).
 - `schedule(fn)` -- how flushes are deferred; default `queueMicrotask`.
 
@@ -308,6 +309,12 @@ Returns a graph object; mutating methods return it, so calls chain.
 - `unchanged(result)` -- the same, and `result` replaces `state.result`.
 - `isUnchanged(value)` -- true for both.
 
+### `live(iterable)`, `isLive(value)`, `LIVE`
+
+- `live(iterable)` -- return it from `run` to make the run [live](#live-nodes): each item of the async iterable settles the node. A frozen marker (`{ [LIVE]: true, iterable }`), so it is opt-in: an async iterable returned without it is a plain value. Throws a `TypeError` for anything that isn't an async iterable. A `run` that is itself an `async function*` needs no marker.
+- `isLive(value)` -- true for what `live` returns.
+- `LIVE` -- `Symbol.for("@johnhenry/dataflow.live")`; like `SKIP` it can't cross `postMessage`, so a Worker returns its own marker and your `run` calls `live(...)` on the page.
+
 TypeScript declarations ship in `src/index.d.ts`.
 
 ## Honest limitations
@@ -317,7 +324,7 @@ TypeScript declarations ship in `src/index.d.ts`.
 - **Cancellation is cooperative.** A superseded run's result is dropped and its signal aborts, but the scheduler can't stop code that ignores the signal. If you need a hard kill, run in something you can terminate (a Worker) and call `reset()` after restarting it.
 - **No first-to-finish race.** Glitch-freedom means a node with skip-consuming inputs runs once all of them settled, never on the first one; see [Skipping](#skipping).
 - **Live producers must cooperate.** A producer that yields forever without ever awaiting anything that takes a turn of the event loop (a timer, I/O) starves it, as any endless async loop does; and `return()` reaches an async generator only at a `yield`, so a long await should follow `ctx.signal` for cleanup to be prompt. A shared source that two runs read in turn (a queue) can hand an item to a run that is about to be superseded; the scheduler drops that run's late items, it can't give them to the next run.
-- **Async iterables are always live.** A `run` that returns (or resolves to) an object with `Symbol.asyncIterator` -- an async generator, a `ReadableStream` -- makes the run live. To keep such an object as a plain result, wrap it (`return { stream }`).
+- **Generator functions are recognized only natively.** A `run` that is itself an `async function*` (a method or a bound one too) is live without the marker; the scheduler tells it from an ordinary function by its built-in type tag. A function that returns a generator, a wrapper around one, or a generator transpiled to plain functions can't be told apart, so it returns `live(iterable)` like any other `run`.
 - **Scans are linear.** Finding dependents walks every node; that is fine for hundreds or a few thousand nodes (a notebook, a spreadsheet tab), not for a million-cell sheet.
 - **One process.** The graph is in-memory and not shared across tabs or machines.
 

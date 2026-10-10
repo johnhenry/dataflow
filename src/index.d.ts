@@ -71,7 +71,7 @@ export interface NodeState<R = unknown> {
   cycle: boolean;
   /**
    * True while the node's run is live: it has emitted (`ctx.emit`) or returned
-   * an async iterable, and hasn't ended (iterable finished, promise resolved,
+   * `live(iterable)`, and hasn't ended (iterable finished, promise resolved,
    * `ctx.close()`, an error, or superseded/reset/deleted). `status` keeps its
    * meaning: `running` until the first settle, then the last settle's status.
    */
@@ -119,17 +119,42 @@ export interface RunContext<R = unknown> {
   onChange(fn: (notice: ChangeNotice) => void): () => boolean;
 }
 
-/** What `run` may return (or resolve to). Any async iterable makes the run live. */
-export type RunResult<R = unknown> = R | Skip | Unchanged<R> | AsyncIterable<R | Skip | Unchanged<R>>;
+/** Return this from `run` to make the run live. `Symbol.for("@johnhenry/dataflow.live")`. */
+export const LIVE: unique symbol;
+
+/** What `live(iterable)` returns: an async iterable marked as a live run. */
+export interface Live<T = unknown> {
+  readonly [LIVE]: true;
+  readonly iterable: AsyncIterable<T>;
+}
+
+/**
+ * Mark an async iterable as a live run: returned from `run`, each item settles
+ * the node. Live runs are opt-in: an async iterable returned without it (a
+ * `ReadableStream`, a generator object) is a plain value. Throws a `TypeError`
+ * for anything that isn't an async iterable.
+ */
+export function live<T>(iterable: AsyncIterable<T>): Live<T>;
+
+/** True for what `live(iterable)` returns. */
+export function isLive(value: unknown): value is Live;
+
+/**
+ * What `run` may return (or resolve to). `live(iterable)` makes the run live.
+ * The `AsyncIterable` member is for a `run` that is itself an `async function*`
+ * (live without the marker); from any other `run` an async iterable is a plain
+ * value -- the type can't tell the two apart.
+ */
+export type RunResult<R = unknown> = R | Skip | Unchanged<R> | Live<R | Skip | Unchanged<R>> | AsyncIterable<R | Skip | Unchanged<R>>;
 
 export interface DataflowOptions<R = unknown> {
   /**
    * Compute one node. May return a value or a promise; return `SKIP` or
    * `skip(reason)` to skip the node, `UNCHANGED` or `unchanged(result)` when
-   * the value equals the previous one. Return an async iterable (an
-   * `async function*` works as `run` itself) to make the run live: each item
+   * the value equals the previous one. Return `live(iterable)`, or make `run`
+   * itself an `async function*`, to make the run live (opt-in): each item
    * settles the node, the next item is pulled once everything downstream of
-   * the previous one settled.
+   * the previous one settled. Any other async iterable is a plain value.
    */
   run: (id: string, ctx: RunContext<R>) => RunResult<R> | Promise<RunResult<R>>;
   /** Called on every state change of every node. */

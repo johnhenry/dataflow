@@ -28,8 +28,8 @@
  * `UNCHANGED` (the caller compared its own values) settles `done` without
  * rerunning dependents that already saw that value.
  *
- * Live nodes: a `run` that returns an async iterable, or calls `ctx.emit`,
- * settles more than once (each item: `version` +1, dependents run). The state
+ * Live nodes (opt-in): a `run` that returns `live(iterable)`, is itself an
+ * `async function*`, or calls `ctx.emit`, settles more than once (each item: `version` +1, dependents run). The state
  * carries `live: true` while the run is open; the status keeps its meaning. An
  * iterable is pulled only once everything downstream of the previous item has
  * settled (backpressure). Superseding, resetting or deleting the node aborts
@@ -75,9 +75,31 @@ export function isUnchanged(value) {
   return value === UNCHANGED || (typeof value === "object" && value !== null && value[UNCHANGED] === true);
 }
 
-/** An async iterable returned by `run` makes the run live (each item settles the node). */
 const isAsyncIterable = (value) =>
   value !== null && (typeof value === "object" || typeof value === "function") && typeof value[Symbol.asyncIterator] === "function";
+
+/** Marks what `live(iterable)` returns. `Symbol.for`, like `SKIP`. */
+export const LIVE = Symbol.for("@johnhenry/dataflow.live");
+
+/**
+ * Return this from `run` to make the run live: each item of `iterable` settles
+ * the node. Live runs are opt-in: an async iterable returned without it (a
+ * `ReadableStream`, a generator object) is a plain value, as in 0.0.2. A `run`
+ * that is itself an `async function*` is live without it.
+ */
+export function live(iterable) {
+  if (!isAsyncIterable(iterable)) throw new TypeError("live: expected an async iterable");
+  return Object.freeze({ [LIVE]: true, iterable });
+}
+
+/** True for what `live(iterable)` returns. */
+export function isLive(value) {
+  return typeof value === "object" && value !== null && value[LIVE] === true;
+}
+
+// A native `async function*` (also as a method, or bound). A function that
+// merely returns a generator object, or a transpiled generator, isn't one.
+const isAsyncGeneratorFunction = (fn) => Object.prototype.toString.call(fn) === "[object AsyncGeneratorFunction]";
 
 const DONE = Object.freeze({ value: undefined, done: true });
 
@@ -92,6 +114,10 @@ const normalizeConsumes = (consumesSkip) => (Array.isArray(consumesSkip) ? [...n
  */
 export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}) {
   if (typeof run !== "function") throw new TypeError("createDataflow: `run` must be a function");
+  // `run` itself an async generator function: every run is live, no marker needed.
+  const runIsLive = isAsyncGeneratorFunction(run);
+  // The iterable a run's result makes live, if any. Anything else is a value.
+  const liveIterable = (value) => (isLive(value) ? value.iterable : runIsLive && isAsyncIterable(value) ? value : undefined);
 
   /**
    * `follow`: how the next run of a queued node treats its dependents (set by
@@ -380,21 +406,22 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     }
     result.then(
       (value) => {
+        const iterable = liveIterable(value);
         if (!isCurrent(r)) {
-          // Superseded before it got going: close what it returned, unread.
-          if (isAsyncIterable(value)) closeReturned(value);
+          // Superseded before it got going: close its live iterable, unread.
+          if (iterable) closeReturned(iterable);
           return;
         }
-        if (isAsyncIterable(value)) {
+        if (iterable) {
           if (r.closed) {
-            closeReturned(value);
+            closeReturned(iterable);
             if (r.settled) finish(r);
             else settleLast(r, { status: "done", result: undefined, error: undefined });
             return;
           }
           let iterator;
           try {
-            iterator = value[Symbol.asyncIterator]();
+            iterator = iterable[Symbol.asyncIterator]();
           } catch (error) {
             settleLast(r, { status: "error", error, result: undefined });
             return;

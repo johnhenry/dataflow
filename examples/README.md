@@ -9,6 +9,7 @@ Runnable, self-verifying examples. Each one asserts the behavior it demonstrates
 | [`03-errors-make-dependents-wait-not-fail.mjs`](./03-errors-make-dependents-wait-not-fail.mjs) | A failing node leaves its dependents `waiting`, not `error`, and fixing it reruns the whole chain without any extra calls. |
 | [`04-skip-values.mjs`](./04-skip-values.mjs) | Two mutually exclusive branches return `SKIP` / `skip(reason)`; the skip spreads to a dependent without running it, a `consumesSkip` coalesce takes whichever branch produced a value, and the skipped chain recovers when its branch applies again. |
 | [`05-partial-runs-and-unchanged.mjs`](./05-partial-runs-and-unchanged.mjs) | `run(id, { follow: false })` runs one cell and flags the expensive cell below it `stale` instead of rerunning it; a `run` that returns `UNCHANGED` for an equal value stops propagation. |
+| [`06-live-nodes.mjs`](./06-live-nodes.mjs) | A live source (an async generator over a stand-in socket) settles once per reading, and a burst is shown one reading at a time (backpressure); changing its input restarts it and the old generator's `finally` runs; a `resume: true` history keeps its live run across changes and accumulates every reading through `ctx.changes`. |
 
 ## Running
 
@@ -20,4 +21,4 @@ node examples/01-a-spreadsheet-recomputes-only-what-changed.mjs
 
 ## Runtime requirements (honest edition)
 
-Plain Node >= 26, no browser needed: the scheduler uses only `queueMicrotask`, `setTimeout` and `AbortController`, which Node, browsers and Workers all have.
+Plain Node >= 26, no browser needed: the scheduler uses only `queueMicrotask`, `setTimeout`, `AbortController` and async iteration, which Node, browsers and Workers all have.

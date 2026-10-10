@@ -36,6 +36,12 @@
  * the signal and calls the iterable's `return()`. A node set with
  * `resume: true` isn't restarted by input changes while it is live: the run is
  * told through `ctx.changes` / `ctx.onChange` instead.
+ *
+ * Events (opt-in): `set(id, { sample: [ids] })` adds inputs that are read but
+ * don't trigger (they order and gate the node like `deps`, but their settles
+ * never run, stale or invalidate it). `set(id, { queue: true })` queues each
+ * trigger instead of superseding: runs go one after another, in order, none
+ * aborted by a newer trigger; each sees `ctx.trigger`.
  */
 
 /**
@@ -105,9 +111,15 @@ const DONE = Object.freeze({ value: undefined, done: true });
 
 const normalizeConsumes = (consumesSkip) => (Array.isArray(consumesSkip) ? [...new Set(consumesSkip)] : Boolean(consumesSkip));
 
+const DEFAULT_QUEUE_LIMIT = 1000;
+
+// What `ctx.trigger` says for a queued run asked for explicitly.
+const RUN_TRIGGER = Object.freeze({ type: "run" });
+const INVALIDATE_TRIGGER = Object.freeze({ type: "invalidate" });
+
 /**
  * @param {{
- *   run: (id: string, ctx: { runId: number, signal: AbortSignal, deps: string[], skipped: string[], emit: (result: unknown) => boolean, close: () => void, changes: AsyncIterable<object>, onChange: (fn: (notice: object) => void) => () => void }) => unknown,
+ *   run: (id: string, ctx: { runId: number, signal: AbortSignal, deps: string[], skipped: string[], sampled: string[], trigger?: object, emit: (result: unknown) => boolean, close: () => void, changes: AsyncIterable<object>, onChange: (fn: (notice: object) => void) => () => void }) => unknown,
  *   onChange?: (id: string, state: object) => void,
  *   schedule?: (fn: () => void) => void,
  * }} options
@@ -126,7 +138,12 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
    * `restart`: an explicit request (`run`, `runAll`, `invalidate`) is queued,
    * so a `resume` node restarts instead of being told about a change.
    * `current`: the run in flight or live (see `start`); cleared when it ends.
-   * @type {Map<string, { deps: string[], autorun: boolean, consumesSkip: boolean | string[], resume: boolean, state: any, controller?: AbortController, follow?: boolean, runFollow?: boolean, settledDone?: boolean, restart?: boolean, current?: any }>}
+   * `deps` trigger the node; `sample` are read but don't trigger; `inputs` is
+   * both (deps first): what orders and gates the node, and what `ctx.deps` lists.
+   * `queue`: triggers are kept in `triggers` (`{ trigger, follow }`, oldest
+   * first) and run one after another; `replace`: a `run(id, { replace: true })`
+   * is queued, so the next start may supersede the run in flight.
+   * @type {Map<string, { deps: string[], sample: string[], inputs: string[], autorun: boolean, consumesSkip: boolean | string[], resume: boolean, queue: boolean, queueLimit: number, triggers?: { trigger: object, follow?: boolean }[], replace?: boolean, state: any, controller?: AbortController, follow?: boolean, runFollow?: boolean, settledDone?: boolean, restart?: boolean, current?: any }>}
    */
   const nodes = new Map();
   const pending = new Set();
@@ -168,9 +185,18 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     emit(id);
   };
 
+  // The nodes `id` triggers (through `deps`). Nodes that only sample `id` are
+  // not among them: its settles don't run them, and nothing spreads to them.
   const dependents = (id) => {
     const out = [];
     for (const [other, node] of nodes) if (node.deps.includes(id)) out.push(other);
+    return out;
+  };
+
+  // The nodes that sample `id` (read it without being triggered by it).
+  const samplers = (id) => {
+    const out = [];
+    for (const [other, node] of nodes) if (node.sample.length && node.sample.includes(id)) out.push(other);
     return out;
   };
 
@@ -193,7 +219,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     const visit = (id) => {
       color.set(id, 1);
       path.push(id);
-      for (const dep of nodes.get(id)?.deps ?? []) {
+      for (const dep of nodes.get(id)?.inputs ?? []) {
         if (!nodes.has(dep)) continue;
         const c = color.get(dep);
         if (c === 1) for (let i = path.lastIndexOf(dep); i < path.length; i++) onCycle.add(path[i]);
@@ -221,6 +247,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
           live: false,
           runId: node.state.runId + 1,
           error: new Error(`"${id}" is part of a dependency cycle`),
+          ...clearTriggers(node),
         });
       } else if (!cyclic.has(id) && node.state.cycle) {
         setState(id, { status: "idle", cycle: false, error: undefined });
@@ -236,7 +263,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     const visit = (id) => {
       if (seen.has(id) || cyclic.has(id) || !nodes.has(id)) return;
       seen.add(id);
-      for (const dep of nodes.get(id).deps) visit(dep);
+      for (const dep of nodes.get(id).inputs) visit(dep);
       if (wanted.has(id)) out.push(id);
     };
     for (const id of ids) visit(id);
@@ -244,9 +271,10 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
   };
 
   // An input is available when its last run resolved, or when it was skipped
-  // (a skip is an answer too: it either spreads or is consumed).
+  // (a skip is an answer too: it either spreads or is consumed). Sampled
+  // inputs gate the node like deps: it waits until each has settled.
   const depsReady = (id) =>
-    nodes.get(id).deps.every((dep) => {
+    nodes.get(id).inputs.every((dep) => {
       const status = nodes.get(dep)?.state.status;
       return status === "done" || status === "skipped";
     });
@@ -255,7 +283,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
 
   const upstreamBusy = (id) => {
     const seen = new Set();
-    const stack = [...(nodes.get(id)?.deps ?? [])];
+    const stack = [...(nodes.get(id)?.inputs ?? [])];
     while (stack.length) {
       const dep = stack.pop();
       if (seen.has(dep)) continue;
@@ -263,7 +291,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
       const node = nodes.get(dep);
       if (!node) continue;
       if (node.state.status === "running" || pending.has(dep)) return true;
-      stack.push(...node.deps);
+      stack.push(...node.inputs);
     }
     return false;
   };
@@ -272,13 +300,59 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     const node = nodes.get(id);
     if (!node || node.state.cycle) return;
     const wasQueued = pending.delete(id);
+    const r = node.current;
     stop(node);
+    // A queue node's interrupted run goes back to the head of its queue (unless
+    // it had already settled, or a `replace` is dropping it): it runs again once
+    // the input recovers, like any waiting node, and no trigger is lost.
+    if (node.queue && r?.entry && !r.settled && !node.replace) node.triggers.unshift(r.entry);
     // A never-run node that nobody queued stays idle: nobody asked it to run.
     // A queued one was asked, so it waits (and runs once its input recovers).
     if (node.state.status !== "idle" || wasQueued) {
-      setState(id, { status: "waiting", runId: node.state.runId + 1, error: undefined, live: false });
+      setState(id, { status: "waiting", runId: node.state.runId + 1, error: undefined, live: false, ...queuedPatch(node) });
     }
   };
+
+  // Queue nodes carry `queued` (triggers waiting) and `dropped` in their state;
+  // other nodes never get those keys.
+  const queuedPatch = (node) => (node.queue ? { queued: node.triggers.length } : {});
+
+  // Forget a queue node's triggers (reset, cycle). Returns the state patch.
+  function clearTriggers(node) {
+    if (!node.queue) return {};
+    node.triggers = [];
+    delete node.replace;
+    return { queued: 0 };
+  }
+
+  // A trigger for a queue node: kept until the node starts a run for it.
+  // Every trigger counts; past `queueLimit` the oldest is dropped (`dropped` +1).
+  function enqueue(id, node, entry) {
+    const patch = {};
+    while (node.triggers.length >= node.queueLimit) {
+      node.triggers.shift();
+      patch.dropped = (patch.dropped ?? node.state.dropped) + 1;
+    }
+    node.triggers.push(entry);
+    setState(id, { ...patch, queued: node.triggers.length });
+    // A run in flight isn't superseded: its end queues the next (see `ended`).
+    if (!node.current || node.replace) pending.add(id);
+  }
+
+  // What `ctx.trigger` says for a settle of `depId` (frozen; `result` is the
+  // reference in the dependency's state, if any).
+  function settleTrigger(depId) {
+    const s = nodes.get(depId).state;
+    const trigger = { type: "settle", id: depId, status: s.status, version: s.version, result: s.result };
+    if (s.skip) trigger.skip = s.skip;
+    return Object.freeze(trigger);
+  }
+
+  // A run of `node` ended (settled for good or finished): a queue node with
+  // triggers left runs the next one.
+  function ended(id, node) {
+    if (node.queue && node.triggers.length) pending.add(id);
+  }
 
   const queueFlush = () => {
     if (flushQueued || paused) return;
@@ -295,6 +369,12 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
         pending.delete(id);
         continue;
       }
+      // A queue node's run in flight is never superseded by a trigger: the
+      // node is queued again when the run ends (a `replace` run supersedes it).
+      if (node.queue && node.current && !node.replace) {
+        pending.delete(id);
+        continue;
+      }
       if (upstreamBusy(id)) continue; // settles later; its completion re-flushes
       pending.delete(id);
       if (!depsReady(id)) {
@@ -303,13 +383,20 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
         for (const down of downstream(id)) markWaiting(down);
         continue;
       }
-      const skippedDeps = node.deps.filter((dep) => nodes.get(dep).state.status === "skipped");
+      // A queue node judges the input that triggered it by that settle (a
+      // value queued before a skip still runs, a skip queued before a value
+      // is still a skip); other inputs as they are now.
+      const trigger = node.queue ? node.triggers[0]?.trigger : undefined;
+      const own = (dep) => trigger?.type === "settle" && trigger.id === dep;
+      const skippedDeps = node.inputs.filter((dep) => (own(dep) ? trigger.status === "skipped" : nodes.get(dep).state.status === "skipped"));
       const spreading = skippedDeps.find((dep) => !consumes(node, dep));
       if (spreading !== undefined) {
-        const follow = node.follow ?? true;
+        // A queue node's trigger is answered by the skip; the next one follows.
+        const follow = node.queue ? (takeTrigger(node).follow ?? true) : (node.follow ?? true);
         delete node.follow;
         delete node.restart;
-        spreadSkip(id, nodes.get(spreading).state.skip, follow);
+        spreadSkip(id, own(spreading) ? trigger.skip : nodes.get(spreading).state.skip, follow);
+        ended(id, node);
         continue;
       }
       // A live `resume` node is told about the change instead of restarted
@@ -378,13 +465,16 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     const controller = new AbortController();
     node.controller = controller;
     const runId = node.state.runId + 1;
-    node.runFollow = node.follow ?? true;
+    // A queue node runs its oldest trigger, with that trigger's `follow`.
+    const entry = node.queue ? takeTrigger(node) : undefined;
+    node.runFollow = (node.queue ? entry.follow : node.follow) ?? true;
     delete node.follow;
     delete node.restart;
     /** One run: settles once (a value), or many times (live: emits and/or iterable items). */
     const r = {
       id,
       runId,
+      entry, // a queue node's trigger ({ trigger, follow }), put back if an input fails mid-run
       follow: node.runFollow,
       ended: false, // superseded, reset, deleted, or finished
       closed: false, // ctx.close() was called: no more emits or items
@@ -397,10 +487,12 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
       listeners: new Set(), // ctx.onChange callbacks
     };
     node.current = r;
-    setState(id, { status: "running", runId, stale: false, unchanged: false, live: false });
+    setState(id, { status: "running", runId, stale: false, unchanged: false, live: false, ...queuedPatch(node) });
+    const ctx = { runId, signal: controller.signal, deps: [...node.inputs], skipped, sampled: [...node.sample], ...liveContext(r) };
+    if (node.queue) ctx.trigger = entry.trigger;
     let result;
     try {
-      result = Promise.resolve(run(id, { runId, signal: controller.signal, deps: [...node.deps], skipped, ...liveContext(r) }));
+      result = Promise.resolve(run(id, ctx));
     } catch (error) {
       result = Promise.reject(error);
     }
@@ -447,6 +539,12 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
         if (isCurrent(r)) settleLast(r, { status: "error", error, result: undefined });
       },
     );
+  }
+
+  // Take a queue node's oldest trigger (a run or a skip answers it).
+  function takeTrigger(node) {
+    delete node.replace;
+    return node.triggers.shift() ?? {};
   }
 
   const closeReturned = (iterable) => {
@@ -522,7 +620,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
   // Tell a live `resume` run that its inputs changed (instead of restarting it).
   function notify(r, skipped) {
     const node = nodes.get(r.id);
-    const notice = Object.freeze({ deps: [...node.deps], skipped: [...skipped], changed: [...r.changed] });
+    const notice = Object.freeze({ deps: [...node.inputs], skipped: [...skipped], changed: [...r.changed] });
     r.changed.clear();
     for (const fn of [...r.listeners]) {
       try {
@@ -580,7 +678,9 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
   // doesn't flush, so it doesn't pull either.
   const downstreamBusy = (id) => {
     for (const down of downstream(id)) {
-      if (pending.has(down) || nodes.get(down)?.state.status === "running") return true;
+      const node = nodes.get(down);
+      // A queue node with triggers left (its run in flight is live) is busy too.
+      if (pending.has(down) || node?.state.status === "running" || (node?.queue && node.triggers.length)) return true;
     }
     return false;
   };
@@ -626,6 +726,10 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     node.current = undefined;
     end(r);
     if (node.state.live) setState(r.id, { live: false });
+    if (node.queue && node.triggers.length) {
+      ended(r.id, node);
+      queueFlush();
+    }
   }
 
   // The run's last settle: its returned value, its error, or an empty iterable.
@@ -637,6 +741,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     node.settledDone = patch.status === "done";
     if (node.state.live) patch = { ...patch, live: false };
     setState(r.id, { ...patch, version: node.state.version + 1 });
+    ended(r.id, node);
     propagate(r.id, patch.status === "error", { follow: node.runFollow });
   }
 
@@ -655,6 +760,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     const patch = { status: "done", error: undefined, unchanged: true };
     if (value !== UNCHANGED) patch.result = result;
     setState(r.id, patch);
+    ended(r.id, node);
     propagate(r.id, false, { follow: node.runFollow, unchanged: true });
   }
 
@@ -665,7 +771,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     const node = nodes.get(id);
     stop(node);
     node.settledDone = false;
-    setState(id, { status: "skipped", runId: node.state.runId + 1, result: undefined, error: undefined, stale: false, unchanged: false, live: false, skip: from });
+    setState(id, { status: "skipped", runId: node.state.runId + 1, result: undefined, error: undefined, stale: false, unchanged: false, live: false, skip: from, ...queuedPatch(node) });
     propagate(id, false, { follow });
   }
 
@@ -687,32 +793,93 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
         // Autorun nodes follow their inputs (unless the run is held); a waiting
         // node was already asked to run; a queued one runs anyway.
         if (d.resume && d.current?.live) d.current.changed.add(id);
-        pending.add(dep);
+        // A queue node keeps each settle that triggers it as a trigger of its
+        // own. A held settle reaching a waiting or queued one adds none (its
+        // queued triggers run anyway), unless it has none left to run.
+        if (d.queue) {
+          if ((follow && d.autorun) || !d.triggers.length) enqueue(dep, d, { trigger: settleTrigger(id) });
+          else if (!d.current) pending.add(dep);
+        } else pending.add(dep);
       } else if (d.state.status === "done" || d.state.status === "skipped") {
         setState(dep, { stale: true });
+      }
+    }
+    // Sampled inputs never trigger: a settle doesn't run, stale or invalidate a
+    // node that samples `id`. Only one already waiting (asked to run, but an
+    // input wasn't ready) runs now that this one settled, as it would for a dep.
+    if (!failed) {
+      for (const s of samplers(id)) {
+        const d = nodes.get(s);
+        if (!d || d.state.cycle || d.state.status !== "waiting") continue;
+        if (d.queue && !d.triggers.length) enqueue(s, d, { trigger: settleTrigger(id) });
+        else if (!d.queue || !d.current) pending.add(s);
       }
     }
     queueFlush();
   }
 
+  // Switch an existing node's `queue` option, or apply a lower `queueLimit`.
+  function setQueue(id, node, queue) {
+    if (queue && !node.queue) {
+      node.queue = true;
+      node.triggers = [];
+      setState(id, { queued: 0, dropped: 0 });
+    } else if (!queue && node.queue) {
+      // Back to superseding: whatever was queued becomes one ordinary run.
+      const had = node.triggers.length;
+      node.queue = false;
+      node.triggers = undefined;
+      delete node.replace;
+      const { queued, dropped, ...rest } = node.state;
+      node.state = rest;
+      emit(id);
+      if (had && !node.state.cycle) {
+        pending.add(id);
+        queueFlush();
+      }
+    } else if (queue && node.triggers.length > node.queueLimit) {
+      const over = node.triggers.length - node.queueLimit;
+      node.triggers.splice(0, over);
+      setState(id, { queued: node.triggers.length, dropped: node.state.dropped + over });
+    }
+  }
+
   const api = {
-    /** Add a node, or replace its dependency list and autorun flag. Never runs anything by itself. */
-    set(id, { deps = [], autorun = true, consumesSkip = false, resume = false } = {}) {
+    /** Add a node, or replace its dependency list and options. Never runs anything by itself. */
+    set(id, { deps = [], sample = [], autorun = true, consumesSkip = false, resume = false, queue = false, queueLimit = DEFAULT_QUEUE_LIMIT } = {}) {
       if (typeof id !== "string" || !id) throw new TypeError("dataflow.set: id must be a non-empty string");
+      if (!Array.isArray(sample)) throw new TypeError("dataflow.set: `sample` must be an array of ids");
+      if (queue && resume) throw new TypeError("dataflow.set: `queue` and `resume` can't be combined");
+      if (!(queueLimit === Infinity || (Number.isInteger(queueLimit) && queueLimit >= 1))) {
+        throw new RangeError("dataflow.set: `queueLimit` must be a positive integer or Infinity");
+      }
       const unique = [...new Set(deps)];
+      // An id in both lists triggers: `deps` wins.
+      const sampled = [...new Set(sample)].filter((s) => !unique.includes(s));
       const existing = nodes.get(id);
       if (existing) {
         existing.deps = unique;
+        existing.sample = sampled;
+        existing.inputs = [...unique, ...sampled];
         existing.autorun = Boolean(autorun);
         existing.consumesSkip = normalizeConsumes(consumesSkip);
         existing.resume = Boolean(resume);
+        existing.queueLimit = queueLimit;
+        setQueue(id, existing, Boolean(queue));
       } else {
+        const state = { status: "idle", version: 0, runId: 0, stale: false, unchanged: false, cycle: false, live: false };
+        if (queue) Object.assign(state, { queued: 0, dropped: 0 });
         nodes.set(id, {
           deps: unique,
+          sample: sampled,
+          inputs: [...unique, ...sampled],
           autorun: Boolean(autorun),
           consumesSkip: normalizeConsumes(consumesSkip),
           resume: Boolean(resume),
-          state: { status: "idle", version: 0, runId: 0, stale: false, unchanged: false, cycle: false, live: false },
+          queue: Boolean(queue),
+          queueLimit,
+          triggers: queue ? [] : undefined,
+          state,
         });
         emit(id);
       }
@@ -748,6 +915,13 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     },
     /** The node's `resume` option (named `resumes` because `resume()` un-pauses the graph). */
     resumes: (id) => nodes.get(id)?.resume,
+    /** The node's sampled inputs (read, but not triggering). */
+    samples: (id) => (nodes.has(id) ? [...nodes.get(id).sample] : undefined),
+    /** The node's `queue` option. */
+    queues: (id) => nodes.get(id)?.queue,
+    /** The node's `queueLimit` (its default too, for a node that doesn't queue). */
+    queueLimit: (id) => nodes.get(id)?.queueLimit,
+    /** The nodes `id` triggers (through `deps`); nodes that only sample it aren't listed. */
     dependents: (id) => dependents(id),
     order: (ids) => order(ids),
     ids: () => [...nodes.keys()],
@@ -756,9 +930,21 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
      * Run a node now, whatever its autorun flag. Autorun dependents follow,
      * unless `follow: false`: then they are held (flagged stale, not run).
      */
-    run(id, { follow = true } = {}) {
+    run(id, { follow = true, replace = false } = {}) {
       const node = nodes.get(id);
       if (!node) return api;
+      if (node.queue) {
+        if (node.state.cycle) return api;
+        // `replace`: drop what is queued and supersede the run in flight, as
+        // a node without `queue` always does.
+        if (replace) {
+          node.triggers = [];
+          node.replace = true;
+        }
+        enqueue(id, node, { trigger: RUN_TRIGGER, follow: Boolean(follow) });
+        queueFlush();
+        return api;
+      }
       node.follow = Boolean(follow);
       node.restart = true;
       pending.add(id);
@@ -770,7 +956,10 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     invalidate(id) {
       const node = nodes.get(id);
       if (!node || node.state.cycle) return api;
-      if (node.autorun) {
+      if (node.autorun && node.queue) {
+        enqueue(id, node, { trigger: INVALIDATE_TRIGGER });
+        queueFlush();
+      } else if (node.autorun) {
         node.restart = true; // a new definition: a live `resume` node restarts too
         pending.add(id);
         queueFlush();
@@ -788,6 +977,10 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
       for (const id of order(ids)) {
         const node = nodes.get(id);
         if (!all && !node.autorun) continue;
+        if (node.queue) {
+          enqueue(id, node, { trigger: RUN_TRIGGER, follow: Boolean(follow) });
+          continue;
+        }
         node.follow = Boolean(follow);
         node.restart = true;
         pending.add(id);
@@ -804,8 +997,10 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
         delete node.follow;
         delete node.restart;
         node.settledDone = false;
+        const cleared = clearTriggers(node); // the queue goes too
         if (node.state.cycle) continue;
-        node.state = { ...node.state, status: "idle", result: undefined, error: undefined, stale: false, unchanged: false, live: false, runId: node.state.runId + 1 };
+        node.state = { ...node.state, status: "idle", result: undefined, error: undefined, stale: false, unchanged: false, live: false, runId: node.state.runId + 1, ...cleared };
+        if (node.queue) node.state.dropped = 0;
         delete node.state.skip;
         emit(id);
       }

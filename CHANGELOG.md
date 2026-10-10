@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.0.4 (2026-10-10)
+
+Events: sampled (non-triggering) inputs and queued (non-superseding) nodes (#8, #9; for johnhenry/miso#99, designed in johnhenry/miso#94). Additive and opt-in: a graph that uses neither `sample` nor `queue` produces exactly 0.0.3's `onChange` sequence (no new state keys; checked by a differential fuzz against 0.0.3 over 800 random graphs that also use live runs, emits and resume); every run's `ctx` gains `sampled` (`[]`).
+
+- **`set(id, { sample: [ids] })`: inputs that are read but don't trigger** (`withLatestFrom`; Noodl's Function with Run connected). A sampled input orders and gates the node like a dependency: the node never starts while it, or anything upstream of it, is queued or running (glitch-free, including a sampled diamond), waits until it has settled once, and waits at its next trigger while it is waiting or failing (and runs once it settles again). Its settles never run, stale, invalidate or notify the node, or queue a trigger. A skipped sampled input spreads its skip when the node is triggered, unless consumed (`consumesSkip`). `ctx.deps` lists `deps` then the sampled ids; **`ctx.sampled`** names them. A cycle through a sampled edge is a cycle; an id in both lists triggers.
+- **`set(id, { queue: true, queueLimit })`: triggers queue instead of superseding.** Each trigger (a settle of a dependency in `deps`, or an explicit `run` / `runAll` / `invalidate`) gets its own run, one after another, in order; none is aborted by a newer trigger. **`ctx.trigger`** (frozen) says what a run is for: `{ type: "settle", id, status, version, result, skip? }` (the dependency's result reference) or `{ type: "run" }` / `{ type: "invalidate" }`. Each trigger is judged by its own settle (a value queued before a skip still runs; a skip is answered with a skip) and keeps its own `follow`.
+- **Bound and counts.** `queueLimit` (default 1000, or `Infinity`) caps waiting triggers; past it the oldest is dropped. Queue nodes, and only they, carry **`state.queued`** and **`state.dropped`**.
+- **Clearing.** `reset()`, `delete(id)`, and the new **`run(id, { replace: true })`** (drop the queue and supersede the run in flight) clear the queue. A failing input aborts the run in flight and puts its trigger back at the head, so it runs again once the input recovers.
+- **Live sources.** A live source feeding a queue node delivers every value in order: emitted bursts queue, and pulled items wait for the queue (backpressure counts a queue node with triggers left as busy). A queue node's own live run holds its queue until it ends.
+- **`queue` and `resume` can't be combined** (`TypeError`); a `resume` node upstream of a queue node works, each of its settles a trigger.
+- New readers `samples(id)`, `queues(id)`, `queueLimit(id)`; `dependents(id)` keeps listing only the nodes `id` triggers.
+- Types: `NodeOptions.sample` / `queue` / `queueLimit`, `NodeState.queued` / `dropped`, `RunContext.sampled` / `trigger`, `Trigger<R>`, `RunNodeOptions` (`replace`), and the new readers.
+- New example `examples/07-events-sample-and-queue.mjs`; README section "Events: sampled inputs and queued nodes"; Guarantees, Backpressure, API and Honest limitations updated (queues hold triggers, not values; one run per triggering settle, so once per branch of a diamond; an interrupted queued run is retried; an event source that hasn't fired yet is `running`, so emit `SKIP` first).
+- **Upgrading:** under npm's caret rules `^0.0.3` matches only `0.0.3`; change the range to `^0.0.4` (or `0.0.4`).
+
 ## 0.0.3 (2026-10-10)
 
 Live nodes: runs that settle more than once, with an opt-in resume (#6, #7; designed in johnhenry/miso#94). Additive and opt-in: a graph whose runs never return `live(...)`, aren't an `async function*`, and never call `ctx.emit` produces the same `onChange` sequence as 0.0.2 (every state now also carries `live: false`); an async iterable returned as a plain value (a `ReadableStream`, a generator object) is still a plain value.

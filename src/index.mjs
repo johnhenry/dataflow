@@ -6,12 +6,15 @@
  * run went. It never stores node values itself, so the values can live
  * anywhere: in memory, in a Worker, in an iframe, on a server.
  *
- * States: idle | waiting | running | done | error
+ * States: idle | waiting | running | done | skipped | error
  *   idle     never run, or reset
  *   waiting  asked to run, but an input is missing, errored or not run yet
  *   running  `run` was called and has not settled
  * (A node queued behind upstream work keeps its previous state until it starts.)
  *   done     the last run resolved
+ *   skipped  the last run returned SKIP / skip(reason), or an input was skipped
+ *            (the skip spreads to dependents without running them, unless they
+ *            declared `consumesSkip`)
  *   error    the last run rejected, or the node sits on a dependency cycle
  *
  * Guarantees: a node never runs while anything upstream of it is pending or
@@ -21,8 +24,28 @@
  */
 
 /**
+ * Return this from `run` to decline to produce a value. The node settles as
+ * `skipped`, and the skip spreads to its dependents (they become `skipped`
+ * without running) except those that declared `consumesSkip`. `Symbol.for`, so
+ * two copies of this package agree on it.
+ */
+export const SKIP = Symbol.for("@johnhenry/dataflow.skip");
+
+/** Like returning `SKIP`, with a reason that dependents see in `state.skip.reason`. */
+export function skip(reason) {
+  return Object.freeze({ [SKIP]: true, reason });
+}
+
+/** True for `SKIP` and for what `skip(reason)` returns. */
+export function isSkip(value) {
+  return value === SKIP || (typeof value === "object" && value !== null && value[SKIP] === true);
+}
+
+const normalizeConsumes = (consumesSkip) => (Array.isArray(consumesSkip) ? [...new Set(consumesSkip)] : Boolean(consumesSkip));
+
+/**
  * @param {{
- *   run: (id: string, ctx: { runId: number, signal: AbortSignal, deps: string[] }) => unknown,
+ *   run: (id: string, ctx: { runId: number, signal: AbortSignal, deps: string[], skipped: string[] }) => unknown,
  *   onChange?: (id: string, state: object) => void,
  *   schedule?: (fn: () => void) => void,
  * }} options
@@ -30,7 +53,7 @@
 export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}) {
   if (typeof run !== "function") throw new TypeError("createDataflow: `run` must be a function");
 
-  /** @type {Map<string, { deps: string[], autorun: boolean, state: any, controller?: AbortController }>} */
+  /** @type {Map<string, { deps: string[], autorun: boolean, consumesSkip: boolean | string[], state: any, controller?: AbortController }>} */
   const nodes = new Map();
   const pending = new Set();
   const listeners = new Set();
@@ -62,7 +85,9 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
   const setState = (id, patch) => {
     const node = nodes.get(id);
     if (!node) return;
-    node.state = { ...node.state, ...patch };
+    const next = { ...node.state, ...patch };
+    if (next.status !== "skipped") delete next.skip; // only a skipped node carries skip info
+    node.state = next;
     emit(id);
   };
 
@@ -138,7 +163,15 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     return out;
   };
 
-  const depsReady = (id) => nodes.get(id).deps.every((dep) => nodes.get(dep)?.state.status === "done");
+  // An input is available when its last run resolved, or when it was skipped
+  // (a skip is an answer too: it either spreads or is consumed).
+  const depsReady = (id) =>
+    nodes.get(id).deps.every((dep) => {
+      const status = nodes.get(dep)?.state.status;
+      return status === "done" || status === "skipped";
+    });
+
+  const consumes = (node, dep) => node.consumesSkip === true || (Array.isArray(node.consumesSkip) && node.consumesSkip.includes(dep));
 
   const upstreamBusy = (id) => {
     const seen = new Set();
@@ -192,11 +225,17 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
         for (const down of downstream(id)) markWaiting(down);
         continue;
       }
-      start(id);
+      const skippedDeps = node.deps.filter((dep) => nodes.get(dep).state.status === "skipped");
+      const spreading = skippedDeps.find((dep) => !consumes(node, dep));
+      if (spreading !== undefined) {
+        spreadSkip(id, nodes.get(spreading).state.skip);
+        continue;
+      }
+      start(id, skippedDeps);
     }
   }
 
-  function start(id) {
+  function start(id, skipped = []) {
     const node = nodes.get(id);
     node.controller?.abort();
     const controller = new AbortController();
@@ -205,12 +244,15 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     setState(id, { status: "running", runId, stale: false });
     let result;
     try {
-      result = Promise.resolve(run(id, { runId, signal: controller.signal, deps: [...node.deps] }));
+      result = Promise.resolve(run(id, { runId, signal: controller.signal, deps: [...node.deps], skipped }));
     } catch (error) {
       result = Promise.reject(error);
     }
     result.then(
-      (value) => settle(id, runId, { status: "done", result: value, error: undefined }),
+      (value) =>
+        isSkip(value)
+          ? settle(id, runId, { status: "skipped", result: undefined, error: undefined, skip: Object.freeze({ source: id, reason: value === SKIP ? undefined : value.reason }) })
+          : settle(id, runId, { status: "done", result: value, error: undefined }),
       (error) => settle(id, runId, { status: "error", error, result: undefined }),
     );
   }
@@ -220,16 +262,32 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     if (!node || node.state.runId !== runId || node.state.status !== "running") return; // superseded
     node.controller = undefined;
     setState(id, { ...patch, version: node.state.version + 1 });
+    propagate(id, patch.status === "error");
+  }
+
+  // An input was skipped and this node doesn't consume it: skip without
+  // running. Nothing ran, so `version` stays; `runId` bumps so that a run of
+  // this node still in flight is dropped when it settles.
+  function spreadSkip(id, from) {
+    const node = nodes.get(id);
+    node.controller?.abort();
+    node.controller = undefined;
+    setState(id, { status: "skipped", runId: node.state.runId + 1, result: undefined, error: undefined, stale: false, skip: from });
+    propagate(id, false);
+  }
+
+  // A node has a new outcome; tell its dependents.
+  function propagate(id, failed) {
     for (const dep of dependents(id)) {
       const d = nodes.get(dep);
       if (!d || d.state.cycle) continue;
-      if (patch.status === "error") {
+      if (failed) {
         markWaiting(dep);
         for (const down of downstream(dep)) markWaiting(down);
       } else if (d.autorun || d.state.status === "waiting") {
         // Autorun nodes follow their inputs; a waiting node was already asked to run.
         pending.add(dep);
-      } else if (d.state.status === "done") {
+      } else if (d.state.status === "done" || d.state.status === "skipped") {
         setState(dep, { stale: true });
       }
     }
@@ -238,17 +296,19 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
 
   const api = {
     /** Add a node, or replace its dependency list and autorun flag. Never runs anything by itself. */
-    set(id, { deps = [], autorun = true } = {}) {
+    set(id, { deps = [], autorun = true, consumesSkip = false } = {}) {
       if (typeof id !== "string" || !id) throw new TypeError("dataflow.set: id must be a non-empty string");
       const unique = [...new Set(deps)];
       const existing = nodes.get(id);
       if (existing) {
         existing.deps = unique;
         existing.autorun = Boolean(autorun);
+        existing.consumesSkip = normalizeConsumes(consumesSkip);
       } else {
         nodes.set(id, {
           deps: unique,
           autorun: Boolean(autorun),
+          consumesSkip: normalizeConsumes(consumesSkip),
           state: { status: "idle", version: 0, runId: 0, stale: false, cycle: false },
         });
         emit(id);
@@ -277,6 +337,10 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
     get: (id) => (nodes.has(id) ? { ...nodes.get(id).state } : undefined),
     deps: (id) => [...(nodes.get(id)?.deps ?? [])],
     autorun: (id) => nodes.get(id)?.autorun,
+    consumesSkip: (id) => {
+      const value = nodes.get(id)?.consumesSkip;
+      return Array.isArray(value) ? [...value] : value;
+    },
     dependents: (id) => dependents(id),
     order: (ids) => order(ids),
     ids: () => [...nodes.keys()],
@@ -296,7 +360,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
       if (node.autorun) {
         pending.add(id);
         queueFlush();
-      } else if (node.state.status === "done") {
+      } else if (node.state.status === "done" || node.state.status === "skipped") {
         setState(id, { stale: true });
       }
       return api;
@@ -317,6 +381,7 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
         node.controller = undefined;
         if (node.state.cycle) continue;
         node.state = { ...node.state, status: "idle", result: undefined, error: undefined, stale: false, runId: node.state.runId + 1 };
+        delete node.state.skip;
         emit(id);
       }
       return api;

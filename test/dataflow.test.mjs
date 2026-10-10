@@ -254,3 +254,29 @@ test("set validates ids and createDataflow requires run", () => {
   const flow = createDataflow({ run: () => 1 });
   assert.throws(() => flow.set(""), TypeError);
 });
+
+test("a throwing listener is reported but doesn't stall scheduling or other listeners", async () => {
+  // Regression (found while writing the docs): an exception from onChange during
+  // settle became an unhandled rejection, dependents never started, idle() hung.
+  const reported = [];
+  const original = globalThis.reportError;
+  globalThis.reportError = (e) => reported.push(e.message);
+  try {
+    const seen = [];
+    const flow = createDataflow({
+      run: (id) => id,
+      onChange() {
+        throw new Error("listener bug");
+      },
+    });
+    flow.subscribe((id, s) => seen.push(`${id}:${s.status}`));
+    flow.set("a").set("b", { deps: ["a"] });
+    flow.runAll();
+    await flow.idle();
+    assert.equal(flow.get("b").status, "done");
+    assert.ok(seen.includes("b:done"), "other listeners still ran");
+    assert.ok(reported.length > 0 && reported.every((m) => m === "listener bug"));
+  } finally {
+    globalThis.reportError = original;
+  }
+});

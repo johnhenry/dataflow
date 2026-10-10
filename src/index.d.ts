@@ -1,4 +1,4 @@
-export type Status = "idle" | "waiting" | "pending" | "running" | "done" | "error";
+export type Status = "idle" | "waiting" | "running" | "done" | "error";
 
 export interface NodeState<R = unknown> {
   /** Where the node is in its lifecycle. */

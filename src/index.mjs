@@ -6,11 +6,11 @@
  * run went. It never stores node values itself, so the values can live
  * anywhere: in memory, in a Worker, in an iframe, on a server.
  *
- * States: idle | waiting | pending | running | done | error
+ * States: idle | waiting | running | done | error
  *   idle     never run, or reset
  *   waiting  asked to run, but an input is missing, errored or not run yet
- *   pending  queued; runs once everything upstream has settled
  *   running  `run` was called and has not settled
+ * (A node queued behind upstream work keeps its previous state until it starts.)
  *   done     the last run resolved
  *   error    the last run rejected, or the node sits on a dependency cycle
  *
@@ -38,11 +38,25 @@ export function createDataflow({ run, onChange, schedule = queueMicrotask } = {}
   let flushQueued = false;
   let paused = false;
 
+  // Like EventTarget: a listener that throws is reported, and neither the
+  // other listeners nor the scheduler are affected.
+  const report =
+    typeof globalThis.reportError === "function"
+      ? (error) => globalThis.reportError(error)
+      : (error) => queueMicrotask(() => {
+          throw error;
+        });
   const emit = (id) => {
     const node = nodes.get(id);
     if (!node) return;
     const snapshot = { ...node.state };
-    for (const fn of listeners) fn(id, snapshot);
+    for (const fn of listeners) {
+      try {
+        fn(id, snapshot);
+      } catch (error) {
+        report(error);
+      }
+    }
   };
 
   const setState = (id, patch) => {

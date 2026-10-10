@@ -73,12 +73,11 @@ Runnable, self-verifying versions are in [`examples/`](examples/).
 | --- | --- |
 | `idle` | Never run, or reset. |
 | `waiting` | Asked to run, but an input is missing, errored, or hasn't run yet. Runs by itself once the input arrives. |
-| `pending` | Queued; starts once everything upstream has settled. (Internal; you see it as the absence of `running`.) |
 | `running` | `run` was called and hasn't settled. |
 | `done` | The last run resolved. `state.result` holds what `run` returned. |
 | `error` | The last run threw or rejected (`state.error`), or the node is on a dependency cycle (`state.cycle === true`). |
 
-Every state also carries `version` (settled runs), `runId` (started runs) and `stale` (a manual node whose inputs or definition changed since its last run).
+A node queued behind upstream work keeps its previous state until it actually starts. Every state also carries `version` (settled runs), `runId` (started runs) and `stale` (a manual node whose inputs or definition changed since its last run).
 
 ## Guarantees
 
@@ -109,7 +108,7 @@ Returns a graph object; mutating methods return it, so calls chain.
 | `pause()` / `resume()` / `paused` | Hold new runs; running ones still settle. |
 | `get(id)`, `has(id)`, `deps(id)`, `autorun(id)`, `dependents(id)`, `ids()` | Read the graph. |
 | `order(ids?)` | Topological order, dependencies first; nodes on a cycle are omitted. |
-| `subscribe(fn)` | Listen to every change; returns an unsubscribe function. |
+| `subscribe(fn)` | Listen to every change; returns an unsubscribe function. A listener that throws is reported (`reportError`) and affects neither other listeners nor scheduling, like an `EventTarget` listener. |
 | `idle()` | Resolves once nothing is queued or running (or the graph is paused). |
 
 TypeScript declarations ship in `src/index.d.ts`.
